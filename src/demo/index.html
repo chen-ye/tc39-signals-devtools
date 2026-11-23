@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="icon" href="data:," />
+    <title>TC39 Signals Playground — DevTools Demo</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="playground-shell">
+      <main class="app-pane">
+        <header class="app-header">
+          <div>
+            <p class="eyebrow">
+              TC39 Signal Polyfill · Interactive Graph Playground
+            </p>
+            <h1>Reactive Order &amp; Pricing Graph</h1>
+          </div>
+          <div class="header-actions">
+            <button
+              type="button"
+              id="toggle-inspector"
+              class="btn secondary"
+              aria-expanded="true"
+            >
+              Hide Embedded Graph
+            </button>
+          </div>
+        </header>
+
+        <section class="controls-grid" aria-label="State Mutators">
+          <article class="control-card">
+            <h2>Order Inputs <span class="badge state">State</span></h2>
+            <div class="field-row">
+              <label for="unit-price">Unit Price ($)</label>
+              <div class="stepper">
+                <button
+                  type="button"
+                  id="price-dec"
+                  aria-label="Decrease price"
+                >
+                  −
+                </button>
+                <input
+                  id="unit-price"
+                  type="number"
+                  value="25"
+                  min="1"
+                  step="5"
+                />
+                <button
+                  type="button"
+                  id="price-inc"
+                  aria-label="Increase price"
+                >
+                  +
+                </button>
+              </div>
+            </div>
+
+            <div class="field-row">
+              <label for="quantity">Quantity</label>
+              <div class="stepper">
+                <button
+                  type="button"
+                  id="qty-dec"
+                  aria-label="Decrease quantity"
+                >
+                  −
+                </button>
+                <input id="quantity" type="number" value="3" min="0" step="1" />
+                <button
+                  type="button"
+                  id="qty-inc"
+                  aria-label="Increase quantity"
+                >
+                  +
+                </button>
+              </div>
+            </div>
+
+            <div class="field-row">
+              <label for="discount-mode">Pricing Branch (Dynamic Edges)</label>
+              <select id="discount-mode">
+                <option value="standard">Standard Rate (uses taxRate)</option>
+                <option value="wholesale">
+                  Wholesale Tier (uses bulkDiscount)
+                </option>
+              </select>
+            </div>
+
+            <div class="field-row">
+              <label for="tax-rate">Tax Rate (%)</label>
+              <input
+                id="tax-rate"
+                type="number"
+                value="8"
+                min="0"
+                max="50"
+                step="1"
+              />
+            </div>
+
+            <div class="field-row">
+              <label for="bulk-discount">Bulk Discount (%)</label>
+              <input
+                id="bulk-discount"
+                type="number"
+                value="15"
+                min="0"
+                max="80"
+                step="5"
+              />
+            </div>
+          </article>
+
+          <article class="control-card">
+            <h2>Edge Cases &amp; Stress Triggers</h2>
+            <div class="field-row">
+              <label for="coupon-input"
+                >Custom Equals (case-insensitive coupon)</label
+              >
+              <div class="inline-group">
+                <input id="coupon-input" type="text" value="SAVE10" />
+                <button type="button" id="apply-coupon" class="btn">
+                  Apply
+                </button>
+              </div>
+            </div>
+
+            <div class="field-row">
+              <label for="divisor-input"
+                >Split People (0 triggers Computed error)</label
+              >
+              <div class="inline-group">
+                <input
+                  id="divisor-input"
+                  type="number"
+                  value="2"
+                  min="0"
+                  step="1"
+                />
+                <button type="button" id="trigger-error" class="btn danger">
+                  Test Error (0)
+                </button>
+              </div>
+            </div>
+
+            <div class="action-bar">
+              <button type="button" id="burst-updates" class="btn primary">
+                Run 5-Step Cascade
+              </button>
+              <button
+                type="button"
+                id="toggle-watcher"
+                class="btn secondary"
+                aria-pressed="true"
+              >
+                Watcher Active
+              </button>
+            </div>
+          </article>
+        </section>
+
+        <section class="outputs-card" aria-label="Live Derived Outputs">
+          <h2>
+            Live Watcher Sink Outputs <span class="badge watcher">Watcher</span>
+          </h2>
+          <dl class="metrics-grid">
+            <div>
+              <dt>Subtotal</dt>
+              <dd id="out-subtotal" data-testid="out-subtotal">—</dd>
+            </div>
+            <div>
+              <dt>Effective Total</dt>
+              <dd id="out-total" data-testid="out-total">—</dd>
+            </div>
+            <div>
+              <dt>Per Person</dt>
+              <dd id="out-per-person" data-testid="out-per-person">—</dd>
+            </div>
+            <div>
+              <dt>Lazy Unread Audit</dt>
+              <dd id="out-lazy" data-testid="out-lazy">
+                (unread until clicked)
+              </dd>
+            </div>
+            <div>
+              <dt>Watcher Notifications</dt>
+              <dd id="out-notifies" data-testid="out-notifies">0</dd>
+            </div>
+          </dl>
+          <div class="lazy-row">
+            <button type="button" id="read-lazy" class="btn secondary">
+              Evaluate Lazy Computed
+            </button>
+            <span class="hint"
+              >Open Chrome DevTools → <strong>Signals</strong> tab to inspect
+              via extension, or use the live panel on the right.</span
+            >
+          </div>
+        </section>
+      </main>
+
+      <aside
+        class="inspector-pane"
+        id="inspector-pane"
+        aria-label="Embedded Signals DevTools Panel"
+      >
+        <iframe
+          id="panel-frame"
+          title="TC39 Signals DevTools Live Graph"
+          src="panel.html"
+        ></iframe>
+      </aside>
+    </div>
+    <script type="module" src="main.js"></script>
+  </body>
+</html>

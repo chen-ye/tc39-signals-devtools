@@ -1,0 +1,772 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="icon" href="data:," />
+    <title>TC39 Signals DevTools</title>
+    <link rel="stylesheet" href="panel.css" />
+  </head>
+  <body>
+    <div class="panel-shell" id="panel-shell">
+      <header class="panel-header">
+        <div class="toolbar" role="toolbar" aria-label="Signal graph controls">
+          <div class="search-wrap">
+            <svg
+              class="icon search-icon"
+              viewBox="0 0 16 16"
+              aria-hidden="true"
+            >
+              <circle
+                cx="7"
+                cy="7"
+                r="4.5"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+              />
+              <line
+                x1="10.5"
+                y1="10.5"
+                x2="14"
+                y2="14"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+              />
+            </svg>
+            <input
+              type="search"
+              id="search-input"
+              class="search-input"
+              data-testid="search-input"
+              placeholder="Filter by name, #id, value, file…"
+              aria-label="Filter signals by name, id, value, or file"
+              autocomplete="off"
+              spellcheck="false"
+            />
+          </div>
+
+          <span class="toolbar-sep" aria-hidden="true"></span>
+
+          <div
+            class="segmented"
+            role="group"
+            aria-label="Filter by signal kind"
+          >
+            <button
+              type="button"
+              class="seg-btn"
+              data-kind-filter="all"
+              data-testid="filter-kind-all"
+              aria-pressed="true"
+            >
+              All
+            </button>
+            <button
+              type="button"
+              class="seg-btn"
+              data-kind-filter="state"
+              data-testid="filter-kind-state"
+              aria-pressed="false"
+            >
+              <span class="kind-dot is-state" aria-hidden="true">S</span>State
+            </button>
+            <button
+              type="button"
+              class="seg-btn"
+              data-kind-filter="computed"
+              data-testid="filter-kind-computed"
+              aria-pressed="false"
+            >
+              <span class="kind-dot is-computed" aria-hidden="true">C</span
+              >Computed
+            </button>
+            <button
+              type="button"
+              class="seg-btn"
+              data-kind-filter="watcher"
+              data-testid="filter-kind-watcher"
+              aria-pressed="false"
+            >
+              <span class="kind-dot is-watcher" aria-hidden="true">W</span
+              >Watcher
+            </button>
+          </div>
+
+          <span class="toolbar-sep" aria-hidden="true"></span>
+
+          <div class="segmented" role="group" aria-label="Filter by liveness">
+            <button
+              type="button"
+              class="seg-btn"
+              data-liveness-filter="all"
+              data-testid="filter-live-all"
+              aria-pressed="true"
+            >
+              All
+            </button>
+            <button
+              type="button"
+              class="seg-btn"
+              data-liveness-filter="live"
+              data-testid="filter-live-live"
+              aria-pressed="false"
+            >
+              Live
+            </button>
+            <button
+              type="button"
+              class="seg-btn"
+              data-liveness-filter="cold"
+              data-testid="filter-live-cold"
+              aria-pressed="false"
+            >
+              Cold
+            </button>
+          </div>
+
+          <button
+            type="button"
+            id="filter-errors"
+            class="tool-btn error-filter-btn"
+            data-testid="filter-errors"
+            aria-pressed="false"
+            title="Show only signals with errors"
+          >
+            <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+              <path
+                d="M8 2.2 14.2 13H1.8L8 2.2Z"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linejoin="round"
+              />
+              <line
+                x1="8"
+                y1="6.2"
+                x2="8"
+                y2="9.4"
+                stroke="currentColor"
+                stroke-width="1.4"
+                stroke-linecap="round"
+              />
+              <circle cx="8" cy="11.3" r="0.8" fill="currentColor" />
+            </svg>
+            <span>Errors</span>
+            <span id="filter-errors-count" class="pill-count">0</span>
+          </button>
+
+          <span class="toolbar-spacer" aria-hidden="true"></span>
+
+          <div
+            class="action-group"
+            role="group"
+            aria-label="Hook and view actions"
+          >
+            <button
+              type="button"
+              id="toggle-pause"
+              class="tool-btn"
+              data-testid="toggle-pause"
+              aria-pressed="false"
+              title="Pause recording timeline events"
+            >
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+                <rect
+                  x="4"
+                  y="3"
+                  width="2.8"
+                  height="10"
+                  rx="0.8"
+                  fill="currentColor"
+                />
+                <rect
+                  x="9.2"
+                  y="3"
+                  width="2.8"
+                  height="10"
+                  rx="0.8"
+                  fill="currentColor"
+                />
+              </svg>
+              <span id="toggle-pause-label">Pause</span>
+            </button>
+
+            <button
+              type="button"
+              id="toggle-stacks"
+              class="tool-btn"
+              data-testid="toggle-stacks"
+              aria-pressed="false"
+              title="Capture callsite stacks on State.set()"
+            >
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+                <path
+                  d="M2.5 5.2 8 2.4l5.5 2.8L8 8 2.5 5.2Z"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.35"
+                  stroke-linejoin="round"
+                />
+                <path
+                  d="M2.5 8.4 8 11.2l5.5-2.8"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.35"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+                <path
+                  d="M2.5 11.4 8 14.2l5.5-2.8"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.35"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+              <span>Stacks</span>
+            </button>
+
+            <button
+              type="button"
+              id="clear-timeline"
+              class="tool-btn"
+              data-testid="clear-timeline"
+              title="Clear recorded timeline events"
+            >
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+                <circle
+                  cx="8"
+                  cy="8"
+                  r="5.5"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.4"
+                />
+                <line
+                  x1="4.2"
+                  y1="4.2"
+                  x2="11.8"
+                  y2="11.8"
+                  stroke="currentColor"
+                  stroke-width="1.4"
+                />
+              </svg>
+              <span>Clear</span>
+            </button>
+
+            <button
+              type="button"
+              id="fit-graph"
+              class="tool-btn"
+              data-testid="fit-graph"
+              title="Fit reactivity graph to viewport"
+            >
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+                <path
+                  d="M2.5 6V2.5H6M10 2.5h3.5V6M13.5 10v3.5H10M6 13.5H2.5V10"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.4"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+              <span>Fit</span>
+            </button>
+
+            <button
+              type="button"
+              id="toggle-theme"
+              class="tool-btn icon-only-sm"
+              data-testid="toggle-theme"
+              title="Switch panel theme (Auto / Light / Dark)"
+            >
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+                <circle
+                  cx="8"
+                  cy="8"
+                  r="5.5"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.4"
+                />
+                <path d="M8 2.5a5.5 5.5 0 0 1 0 11Z" fill="currentColor" />
+              </svg>
+              <span id="toggle-theme-label" class="theme-label">Auto</span>
+            </button>
+          </div>
+        </div>
+
+        <div
+          class="status-strip"
+          aria-label="Graph statistics and page bridge controls"
+        >
+          <div class="status-left">
+            <span
+              id="connection-status"
+              class="conn-pill"
+              data-testid="connection-status"
+              data-state="connecting"
+            >
+              <span class="conn-dot" aria-hidden="true"></span>
+              <span id="connection-status-text">Connecting…</span>
+            </span>
+
+            <span
+              id="runtime-badges"
+              class="runtime-badges"
+              aria-label="Active signal runtimes"
+            ></span>
+
+            <dl class="stats-bar" data-testid="stats-bar">
+              <div class="stat-item">
+                <dt>States</dt>
+                <dd id="stat-states" data-testid="stat-states">0</dd>
+              </div>
+              <div class="stat-item">
+                <dt>Computeds</dt>
+                <dd id="stat-computeds" data-testid="stat-computeds">0</dd>
+              </div>
+              <div class="stat-item">
+                <dt>Watchers</dt>
+                <dd id="stat-watchers" data-testid="stat-watchers">0</dd>
+              </div>
+              <div class="stat-item">
+                <dt>Edges</dt>
+                <dd id="stat-edges" data-testid="stat-edges">0</dd>
+              </div>
+              <div class="stat-item is-error-stat" id="stat-errors-wrap">
+                <dt>Errors</dt>
+                <dd id="stat-errors" data-testid="stat-errors">0</dd>
+              </div>
+            </dl>
+
+            <span id="filtered-pill" class="filtered-pill" hidden>
+              <span id="filtered-pill-text"></span>
+              <button
+                type="button"
+                id="filtered-reset-btn"
+                class="inline-link-btn"
+              >
+                Reset
+              </button>
+            </span>
+          </div>
+
+          <div class="status-right" data-testid="site-toggle-bar">
+            <span
+              id="mode-badge"
+              class="mode-badge"
+              data-testid="mode-badge"
+              hidden
+              >Bridge</span
+            >
+
+            <button
+              type="button"
+              id="site-toggle"
+              class="site-toggle-btn"
+              data-testid="site-toggle"
+              aria-pressed="false"
+              hidden
+              title="Inject globalThis.Signal polyfill at document_start for this origin"
+            >
+              <span class="toggle-track" aria-hidden="true"
+                ><span class="toggle-thumb"></span
+              ></span>
+              <span class="site-toggle-copy"
+                >Inject <code>globalThis.Signal</code></span
+              >
+              <code id="site-origin-label" class="origin-code"></code>
+            </button>
+
+            <button
+              type="button"
+              id="reload-tab"
+              class="tool-btn accent-btn"
+              data-testid="reload-tab"
+              hidden
+            >
+              Reload tab
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <main
+        class="workspace"
+        id="workspace"
+        data-active-tab="inspector"
+        data-timeline-collapsed="false"
+      >
+        <section
+          class="graph-stage"
+          id="graph-stage"
+          aria-label="Reactivity graph canvas"
+        >
+          <div class="graph-mount" id="graph-mount"></div>
+
+          <div class="empty-state" id="empty-state" data-testid="empty-state">
+            <div class="empty-card">
+              <div class="empty-header">
+                <span class="empty-status-badge" id="empty-bridge-status"
+                  >Waiting for signals</span
+                >
+                <h1 class="empty-title">
+                  No TC39 Signals detected on this page
+                </h1>
+                <p class="empty-desc">
+                  Pages importing <code>signal-polyfill</code> inside a private
+                  ESM bundle do not expose it on <code>globalThis</code>.
+                  Connect the page using one of these three options:
+                </p>
+              </div>
+
+              <ol class="setup-list">
+                <li class="setup-item">
+                  <div class="setup-item-head">
+                    <strong
+                      >1. Enable per-origin
+                      <code>globalThis.Signal</code> injection</strong
+                    >
+                    <button
+                      type="button"
+                      id="empty-site-toggle"
+                      class="tool-btn accent-btn"
+                      data-testid="empty-site-toggle"
+                      hidden
+                    >
+                      Enable for origin
+                    </button>
+                  </div>
+                  <p class="setup-note">
+                    Best for apps resolving
+                    <code>globalThis.Signal ?? Polyfill</code>. Toggle in the
+                    status strip and reload the tab.
+                  </p>
+                </li>
+
+                <li class="setup-item">
+                  <div class="setup-item-head">
+                    <strong
+                      >2. Wrap imports automatically with the Vite
+                      plugin</strong
+                    >
+                  </div>
+                  <pre
+                    class="code-snippet"
+                  ><code>import { signalsDevtoolsPlugin } from "tc39-signals-devtools/vite";
+export default defineConfig({ plugins: [signalsDevtoolsPlugin()] });</code></pre>
+                </li>
+
+                <li class="setup-item">
+                  <div class="setup-item-head">
+                    <strong
+                      >3. Register a private runtime or Watcher directly</strong
+                    >
+                  </div>
+                  <pre
+                    class="code-snippet"
+                  ><code>globalThis.__SIGNALS_DEVTOOLS_HOOK__?.register({
+  name: "app",
+  Signal,
+  watchers: [watcher],
+});</code></pre>
+                </li>
+              </ol>
+            </div>
+          </div>
+
+          <div
+            class="filter-empty"
+            id="filter-empty"
+            data-testid="filter-empty"
+            hidden
+          >
+            <div class="filter-empty-card">
+              <p class="filter-empty-title">
+                No signals match the active filters
+              </p>
+              <p class="filter-empty-sub" id="filter-empty-sub"></p>
+              <button
+                type="button"
+                id="reset-filters"
+                class="tool-btn accent-btn"
+                data-testid="reset-filters"
+              >
+                Reset filters
+              </button>
+            </div>
+          </div>
+
+          <div class="graph-legend" aria-hidden="true">
+            <span class="legend-item"
+              ><span class="legend-swatch is-state">S</span>State</span
+            >
+            <span class="legend-item"
+              ><span class="legend-swatch is-computed">C</span>Computed</span
+            >
+            <span class="legend-item"
+              ><span class="legend-swatch is-watcher">W</span>Watcher</span
+            >
+            <span class="legend-item"
+              ><span class="legend-line is-cause"></span>Cause</span
+            >
+          </div>
+
+          <div class="graph-hud" role="group" aria-label="Graph zoom controls">
+            <button
+              type="button"
+              id="zoom-out"
+              class="hud-btn"
+              data-testid="zoom-out"
+              aria-label="Zoom out"
+              title="Zoom out (−)"
+            >
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+                <line
+                  x1="3.5"
+                  y1="8"
+                  x2="12.5"
+                  y2="8"
+                  stroke="currentColor"
+                  stroke-width="1.5"
+                  stroke-linecap="round"
+                />
+              </svg>
+            </button>
+            <button
+              type="button"
+              id="zoom-level"
+              class="hud-readout"
+              data-testid="zoom-level"
+              title="Reset zoom to 100%"
+            >
+              100%
+            </button>
+            <button
+              type="button"
+              id="zoom-in"
+              class="hud-btn"
+              data-testid="zoom-in"
+              aria-label="Zoom in"
+              title="Zoom in (+)"
+            >
+              <svg class="icon" viewBox="0 0 16 16" aria-hidden="true">
+                <line
+                  x1="8"
+                  y1="3.5"
+                  x2="8"
+                  y2="12.5"
+                  stroke="currentColor"
+                  stroke-width="1.5"
+                  stroke-linecap="round"
+                />
+                <line
+                  x1="3.5"
+                  y1="8"
+                  x2="12.5"
+                  y2="8"
+                  stroke="currentColor"
+                  stroke-width="1.5"
+                  stroke-linecap="round"
+                />
+              </svg>
+            </button>
+            <span class="hud-sep" aria-hidden="true"></span>
+            <button
+              type="button"
+              id="graph-fit-btn"
+              class="hud-btn hud-text-btn"
+              data-testid="graph-fit-btn"
+              title="Fit graph to view"
+            >
+              Fit
+            </button>
+          </div>
+        </section>
+
+        <div
+          class="drawer-tabs"
+          role="tablist"
+          aria-label="Inspector and timeline views"
+        >
+          <button
+            type="button"
+            role="tab"
+            id="tab-inspector"
+            class="drawer-tab"
+            data-testid="tab-inspector"
+            aria-selected="true"
+            aria-controls="inspector-pane"
+          >
+            Inspector
+          </button>
+          <button
+            type="button"
+            role="tab"
+            id="tab-timeline"
+            class="drawer-tab"
+            data-testid="tab-timeline"
+            aria-selected="false"
+            aria-controls="timeline-pane"
+          >
+            <span>Timeline</span>
+            <span id="tab-timeline-count" class="tab-count">0</span>
+          </button>
+        </div>
+
+        <aside
+          class="inspector-pane"
+          id="inspector-pane"
+          role="tabpanel"
+          aria-labelledby="tab-inspector"
+          aria-label="Signal inspector"
+          data-testid="inspector-view"
+        >
+          <div class="pane-header">
+            <h2 class="pane-title">Inspector</h2>
+            <span id="inspector-subtitle" class="pane-subtitle">Overview</span>
+          </div>
+          <div class="inspector-body" id="inspector-body"></div>
+        </aside>
+
+        <section
+          class="timeline-pane"
+          id="timeline-pane"
+          role="tabpanel"
+          aria-labelledby="tab-timeline"
+          aria-label="Causal event timeline"
+          data-testid="timeline-view"
+        >
+          <div class="pane-header timeline-header">
+            <div class="timeline-title-group">
+              <h2 class="pane-title">Timeline</h2>
+              <span id="timeline-count" class="pill-count">0</span>
+              <span id="timeline-dropped" class="dropped-badge" hidden></span>
+            </div>
+
+            <div
+              class="segmented compact"
+              role="group"
+              aria-label="Filter timeline event type"
+            >
+              <button
+                type="button"
+                class="seg-btn"
+                data-event-filter="all"
+                data-testid="timeline-filter-all"
+                aria-pressed="true"
+              >
+                All
+              </button>
+              <button
+                type="button"
+                class="seg-btn"
+                data-event-filter="set"
+                data-testid="timeline-filter-set"
+                aria-pressed="false"
+              >
+                set
+              </button>
+              <button
+                type="button"
+                class="seg-btn"
+                data-event-filter="run"
+                data-testid="timeline-filter-run"
+                aria-pressed="false"
+              >
+                run
+              </button>
+              <button
+                type="button"
+                class="seg-btn"
+                data-event-filter="error"
+                data-testid="timeline-filter-error"
+                aria-pressed="false"
+              >
+                error
+              </button>
+              <button
+                type="button"
+                class="seg-btn"
+                data-event-filter="notify"
+                data-testid="timeline-filter-notify"
+                aria-pressed="false"
+              >
+                notify
+              </button>
+              <button
+                type="button"
+                class="seg-btn"
+                data-event-filter="create"
+                data-testid="timeline-filter-create"
+                aria-pressed="false"
+              >
+                create
+              </button>
+            </div>
+
+            <div class="timeline-actions">
+              <button
+                type="button"
+                id="timeline-follow-selection"
+                class="tool-btn compact"
+                data-testid="timeline-follow-selection"
+                aria-pressed="false"
+                title="Show only events for the selected signal and its direct causes"
+              >
+                Selected only
+              </button>
+              <button
+                type="button"
+                id="timeline-clear-btn"
+                class="tool-btn compact"
+                data-testid="timeline-clear-btn"
+                title="Clear timeline events"
+              >
+                Clear
+              </button>
+              <button
+                type="button"
+                id="timeline-collapse-btn"
+                class="tool-btn compact collapse-only-wide"
+                data-testid="timeline-collapse-btn"
+                aria-expanded="true"
+                title="Collapse or expand timeline drawer"
+              >
+                <svg
+                  class="icon chevron-icon"
+                  viewBox="0 0 16 16"
+                  aria-hidden="true"
+                >
+                  <path
+                    d="M4 6.5 8 10.5 12 6.5"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.5"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  />
+                </svg>
+              </button>
+            </div>
+          </div>
+
+          <div
+            class="timeline-body"
+            id="timeline-body"
+            data-testid="timeline-list"
+            role="list"
+          ></div>
+        </section>
+      </main>
+    </div>
+
+    <script type="module" src="panel.js"></script>
+  </body>
+</html>
