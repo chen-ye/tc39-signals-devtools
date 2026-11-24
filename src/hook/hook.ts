@@ -44,6 +44,9 @@ export function createSignalsHook(): SignalsDevtoolsHook {
     subscribe(listener) {
       return engine.subscribe(listener);
     },
+    getTargetFunction(nodeId) {
+      return engine.getTargetFunction(nodeId);
+    },
   };
 }
 

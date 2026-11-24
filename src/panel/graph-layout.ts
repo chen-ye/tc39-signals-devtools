@@ -3,12 +3,58 @@ import type {
   SignalKind,
   SignalNodeSnapshot,
 } from "../protocol/types.ts";
+import {
+  computeHierarchicLayout,
+  type LayoutEdgeInput,
+  type LayoutNodeInput,
+  type LayoutPoint,
+} from "../shared/hierarchic-layout.ts";
+import {
+  formatSemanticTitle,
+  smartTruncateToPx,
+  splitTwoLineTitle,
+  type TwoLineTitle,
+} from "../shared/label-format.ts";
+import { measureTextPx } from "../shared/text-measure.ts";
+
+export type { LayoutPoint, TwoLineTitle };
 
 export const NODE_WIDTH = 212;
 export const NODE_HEIGHT = 72;
 export const LAYER_GAP = 88;
 export const ROW_GAP = 22;
 export const CANVAS_PADDING = 36;
+
+const MIN_CARD_WIDTH = 224;
+const MAX_CARD_WIDTH = 296;
+const TALL_CARD_HEIGHT = 86;
+const DEFAULT_BUS_THRESHOLD = 5;
+
+const TITLE_FONT =
+  '600 12px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+const SUB_FONT =
+  '400 11px ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace';
+const ID_FONT =
+  '400 10px ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace';
+
+export interface BusTrunkSegment {
+  readonly busGroupKey: string;
+  readonly layerIndex: number;
+  readonly sourceId: number;
+  readonly kind: SignalKind;
+  readonly x: number;
+  readonly yStart: number;
+  readonly yEnd: number;
+  readonly path: string;
+  readonly memberEdgeIds: ReadonlyArray<string>;
+}
+
+export interface BusJunctionPoint {
+  readonly x: number;
+  readonly y: number;
+  readonly kind: SignalKind;
+  readonly busGroupKey?: string;
+}
 
 export interface PositionedNode {
   readonly node: SignalNodeSnapshot;
@@ -18,9 +64,16 @@ export interface PositionedNode {
   readonly y: number;
   readonly width: number;
   readonly height: number;
+  readonly formattedTitle?: string;
+  readonly formattedTitleLines?: TwoLineTitle;
+  readonly subtitleLabel?: string | null;
+  readonly isCompact?: boolean;
+  readonly componentIndex?: number;
+  readonly isIsolated?: boolean;
 }
 
 export interface RoutedEdge {
+  readonly id?: string;
   readonly sourceId: number;
   readonly sinkId: number;
   readonly x1: number;
@@ -28,6 +81,10 @@ export interface RoutedEdge {
   readonly x2: number;
   readonly y2: number;
   readonly path: string;
+  readonly points?: ReadonlyArray<LayoutPoint>;
+  readonly isFeedback?: boolean;
+  readonly isBusMember?: boolean;
+  readonly busGroupKey?: string | null;
 }
 
 export interface GraphLayout {
@@ -37,6 +94,18 @@ export interface GraphLayout {
   readonly width: number;
   readonly height: number;
   readonly layerCount: number;
+  readonly busTrunks?: ReadonlyArray<BusTrunkSegment>;
+  readonly junctions?: ReadonlyArray<BusJunctionPoint>;
+}
+
+interface PreparedNodeMeta {
+  readonly node: SignalNodeSnapshot;
+  readonly width: number;
+  readonly height: number;
+  readonly formattedTitle: string;
+  readonly formattedTitleLines: TwoLineTitle;
+  readonly subtitleLabel: string | null;
+  readonly isCompact: boolean;
 }
 
 const KIND_ORDER: Record<SignalKind, number> = {
@@ -45,47 +114,117 @@ const KIND_ORDER: Record<SignalKind, number> = {
   watcher: 2,
 };
 
-export function computeGraphLayout(
-  nodes: ReadonlyArray<SignalNodeSnapshot>,
-  edges: ReadonlyArray<SignalEdgeSnapshot>,
-): GraphLayout {
-  if (nodes.length === 0) {
-    return {
-      nodes: [],
-      edges: [],
-      nodeById: new Map(),
-      width: CANVAS_PADDING * 2,
-      height: CANVAS_PADDING * 2,
-      layerCount: 0,
-    };
+function clamp(min: number, max: number, value: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+function compareNodes(a: SignalNodeSnapshot, b: SignalNodeSnapshot): number {
+  const kindDiff = KIND_ORDER[a.kind] - KIND_ORDER[b.kind];
+  if (kindDiff !== 0) return kindDiff;
+  return a.id - b.id;
+}
+
+function pickRawNodeTitle(node: SignalNodeSnapshot): string {
+  const explicit = node.label?.trim();
+  if (explicit && explicit.length > 0) return explicit;
+
+  const auto = node.autoLabel?.trim();
+  if (auto && auto.length > 0) return auto;
+
+  const rawFn = node.site?.fn?.trim();
+  if (rawFn && rawFn.length > 0) {
+    const cleaned = rawFn
+      .replace(/\.<instance_members_initializer>/g, "")
+      .replace(/<instance_members_initializer>/g, "")
+      .replace(/^Object\./, "")
+      .trim();
+    if (
+      cleaned.length > 0 &&
+      cleaned !== "<anonymous>" &&
+      !/^new\s*$/i.test(cleaned)
+    ) {
+      return cleaned;
+    }
   }
 
-  const nodeMap = new Map<number, SignalNodeSnapshot>();
+  return `${node.kind} #${node.id}`;
+}
+
+function prepareNodeMeta(node: SignalNodeSnapshot): PreparedNodeMeta {
+  const rawTitle = pickRawNodeTitle(node);
+  const semantic = formatSemanticTitle(rawTitle, {
+    ownerLabel: node.ownerLabel ?? null,
+  });
+
+  const badgeAndLeftPad = node.kind === "state" ? 36 : 33;
+  const rightEdgeInset = node.kind === "watcher" ? 15 : 11;
+  const idReserve =
+    Math.ceil(measureTextPx(`#${node.id}`, ID_FONT)) + 8 + rightEdgeInset;
+  const horizontalReserve = badgeAndLeftPad + idReserve;
+
+  const titleNeed =
+    measureTextPx(semantic.title, TITLE_FONT) + horizontalReserve;
+  const subSample = semantic.ownerLabel ?? node.value?.text ?? "";
+  const subNeed = subSample
+    ? Math.min(276, measureTextPx(subSample, SUB_FONT) + 32)
+    : 0;
+
+  const cardWidth = clamp(
+    MIN_CARD_WIDTH,
+    MAX_CARD_WIDTH,
+    Math.ceil(Math.max(MIN_CARD_WIDTH, titleNeed, subNeed)),
+  );
+  const availTitlePx = Math.max(40, cardWidth - horizontalReserve);
+
+  const formattedTitle = smartTruncateToPx(
+    semantic.title,
+    availTitlePx,
+    TITLE_FONT,
+    semantic.disambiguator,
+  );
+  const formattedTitleLines = splitTwoLineTitle(
+    semantic.title,
+    availTitlePx,
+    TITLE_FONT,
+    semantic.disambiguator,
+  );
+  const cardHeight =
+    formattedTitleLines.line2 !== null ? TALL_CARD_HEIGHT : NODE_HEIGHT;
+
+  return {
+    node,
+    width: cardWidth,
+    height: cardHeight,
+    formattedTitle,
+    formattedTitleLines,
+    subtitleLabel: semantic.ownerLabel,
+    isCompact: false,
+  };
+}
+
+function computeSemanticLayerHints(
+  nodes: ReadonlyArray<SignalNodeSnapshot>,
+  nodeMap: ReadonlyMap<number, SignalNodeSnapshot>,
+  validEdges: ReadonlyArray<SignalEdgeSnapshot>,
+): ReadonlyMap<number, number> {
   const outgoing = new Map<number, number[]>();
   const incoming = new Map<number, number[]>();
   const inDegree = new Map<number, number>();
 
   for (const node of nodes) {
-    nodeMap.set(node.id, node);
     outgoing.set(node.id, []);
     incoming.set(node.id, []);
     inDegree.set(node.id, 0);
   }
 
-  const validEdges: SignalEdgeSnapshot[] = [];
-  for (const edge of edges) {
-    if (edge.sourceId === edge.sinkId) continue;
-    if (!nodeMap.has(edge.sourceId) || !nodeMap.has(edge.sinkId)) continue;
-    validEdges.push(edge);
+  for (const edge of validEdges) {
     outgoing.get(edge.sourceId)?.push(edge.sinkId);
     incoming.get(edge.sinkId)?.push(edge.sourceId);
     inDegree.set(edge.sinkId, (inDegree.get(edge.sinkId) ?? 0) + 1);
   }
 
-  // Kahn's topological sort with longest-path layer assignment (cycle-safe)
   const layerById = new Map<number, number>();
   const queue: number[] = [];
-
   for (const node of nodes) {
     if ((inDegree.get(node.id) ?? 0) === 0) {
       queue.push(node.id);
@@ -112,7 +251,6 @@ export function computeGraphLayout(
     }
   }
 
-  // Cycle-breaking fallback for any nodes participating in a cycle
   if (processed.size < nodes.length) {
     const remaining = nodes
       .filter((n) => !processed.has(n.id))
@@ -129,17 +267,13 @@ export function computeGraphLayout(
     }
   }
 
-  // Align isolated Computeds on at least layer 1 and standalone Watchers on the terminal sink layer
-  // whenever the graph has upstream signals, reducing Column 0 vertical stacking and edge spans.
+  const hasStates = nodes.some((n) => n.kind === "state");
   const hasNonWatcherSignals = nodes.some((n) => n.kind !== "watcher");
   const hasIncoming = (id: number) => (incoming.get(id)?.length ?? 0) > 0;
+
   let maxSignalLayer = 0;
   for (const node of nodes) {
-    if (
-      node.kind === "computed" &&
-      !hasIncoming(node.id) &&
-      nodes.some((n) => n.kind === "state")
-    ) {
+    if (node.kind === "computed" && !hasIncoming(node.id) && hasStates) {
       layerById.set(node.id, Math.max(layerById.get(node.id) ?? 0, 1));
     }
     if (node.kind !== "watcher") {
@@ -147,184 +281,305 @@ export function computeGraphLayout(
       if (l > maxSignalLayer) maxSignalLayer = l;
     }
   }
-  if (hasNonWatcherSignals) {
-    for (const node of nodes) {
-      if (node.kind === "watcher" && !hasIncoming(node.id)) {
-        layerById.set(
-          node.id,
-          Math.max(layerById.get(node.id) ?? 0, maxSignalLayer + 1),
-        );
-      }
+
+  const minLayerHintById = new Map<number, number>();
+  for (const node of nodes) {
+    let hint = 0;
+    if (node.kind === "computed" && !hasIncoming(node.id) && hasStates) {
+      hint = 1;
+    } else if (
+      node.kind === "watcher" &&
+      !hasIncoming(node.id) &&
+      hasNonWatcherSignals
+    ) {
+      hint = maxSignalLayer + 1;
     }
+    minLayerHintById.set(node.id, hint);
   }
 
+  return minLayerHintById;
+}
+
+function layoutDisconnectedColumns(
+  nodes: ReadonlyArray<SignalNodeSnapshot>,
+  metaById: ReadonlyMap<number, PreparedNodeMeta>,
+  minLayerHintById: ReadonlyMap<number, number>,
+): GraphLayout {
   let maxLayer = 0;
-  for (const layer of layerById.values()) {
-    if (layer > maxLayer) maxLayer = layer;
+  for (const node of nodes) {
+    const l = minLayerHintById.get(node.id) ?? 0;
+    if (l > maxLayer) maxLayer = l;
   }
 
-  const layers: SignalNodeSnapshot[][] = Array.from(
+  const layers: PreparedNodeMeta[][] = Array.from(
     { length: maxLayer + 1 },
     () => [],
   );
   for (const node of nodes) {
-    const layer = layerById.get(node.id) ?? 0;
-    layers[layer]?.push(node);
+    const l = minLayerHintById.get(node.id) ?? 0;
+    const meta = metaById.get(node.id);
+    if (meta) layers[l]?.push(meta);
   }
 
-  for (const layerNodes of layers) {
-    layerNodes.sort(compareNodes);
+  const nonEmptyLayers = layers.filter((layer) => layer.length > 0);
+  for (const layerNodes of nonEmptyLayers) {
+    layerNodes.sort((a, b) => compareNodes(a.node, b.node));
   }
 
-  // Two-pass barycenter crossing reduction (forward then backward)
-  for (let pass = 0; pass < 2; pass++) {
-    for (let l = 1; l < layers.length; l++) {
-      const prevRowById = indexLayer(layers[l - 1]!);
-      sortLayerByBarycenter(layers[l]!, incoming, prevRowById);
+  const colWidths = nonEmptyLayers.map((layerNodes) => {
+    let maxW = MIN_CARD_WIDTH;
+    for (const m of layerNodes) {
+      if (m.width > maxW) maxW = m.width;
     }
-    for (let l = layers.length - 2; l >= 0; l--) {
-      const nextRowById = indexLayer(layers[l + 1]!);
-      sortLayerByBarycenter(layers[l]!, outgoing, nextRowById);
+    return maxW;
+  });
+
+  const colHeights = nonEmptyLayers.map((layerNodes) => {
+    let totalH = Math.max(0, layerNodes.length - 1) * ROW_GAP;
+    for (const m of layerNodes) {
+      totalH += m.height;
     }
+    return totalH;
+  });
+
+  let maxColumnHeight = 0;
+  for (const h of colHeights) {
+    if (h > maxColumnHeight) maxColumnHeight = h;
   }
 
-  let maxRows = 1;
-  for (const layerNodes of layers) {
-    if (layerNodes.length > maxRows) maxRows = layerNodes.length;
+  const colX: number[] = [];
+  let cursorX = CANVAS_PADDING;
+  for (let l = 0; l < nonEmptyLayers.length; l++) {
+    colX.push(cursorX);
+    cursorX += (colWidths[l] ?? MIN_CARD_WIDTH) + LAYER_GAP;
   }
 
-  const maxColumnHeight =
-    maxRows * NODE_HEIGHT + Math.max(0, maxRows - 1) * ROW_GAP;
   const positionedNodes: PositionedNode[] = [];
-  const positionedById = new Map<number, PositionedNode>();
+  const nodeById = new Map<number, PositionedNode>();
 
-  for (let l = 0; l < layers.length; l++) {
-    const layerNodes = layers[l]!;
-    const colHeight =
-      layerNodes.length * NODE_HEIGHT +
-      Math.max(0, layerNodes.length - 1) * ROW_GAP;
-    const yOffset =
-      CANVAS_PADDING + Math.round((maxColumnHeight - colHeight) / 2);
-    const x = CANVAS_PADDING + l * (NODE_WIDTH + LAYER_GAP);
+  for (let l = 0; l < nonEmptyLayers.length; l++) {
+    const layerNodes = nonEmptyLayers[l]!;
+    const colW = colWidths[l] ?? MIN_CARD_WIDTH;
+    const colH = colHeights[l] ?? 0;
+    const x = colX[l] ?? CANVAS_PADDING;
+    let y = CANVAS_PADDING + Math.round((maxColumnHeight - colH) / 2);
 
     for (let r = 0; r < layerNodes.length; r++) {
-      const node = layerNodes[r]!;
-      const y = yOffset + r * (NODE_HEIGHT + ROW_GAP);
+      const meta = layerNodes[r]!;
       const positioned: PositionedNode = {
-        node,
+        node: meta.node,
         layer: l,
         row: r,
         x,
         y,
-        width: NODE_WIDTH,
-        height: NODE_HEIGHT,
+        width: colW,
+        height: meta.height,
+        formattedTitle: meta.formattedTitle,
+        formattedTitleLines: meta.formattedTitleLines,
+        subtitleLabel: meta.subtitleLabel,
+        isCompact: meta.isCompact,
+        componentIndex: 0,
+        isIsolated: true,
       };
       positionedNodes.push(positioned);
-      positionedById.set(node.id, positioned);
+      nodeById.set(meta.node.id, positioned);
+      y += meta.height + ROW_GAP;
     }
   }
 
-  const routedEdges: RoutedEdge[] = validEdges.map((edge) => {
-    const src = positionedById.get(edge.sourceId)!;
-    const dst = positionedById.get(edge.sinkId)!;
-    const x1 = src.x + src.width;
-    const y1 = src.y + src.height / 2;
-    const x2 = dst.x;
-    const y2 = dst.y + dst.height / 2;
-    const path = buildEdgePath(x1, y1, x2, y2);
-    return {
-      sourceId: edge.sourceId,
-      sinkId: edge.sinkId,
-      x1,
-      y1,
-      x2,
-      y2,
-      path,
-    };
-  });
-
+  const totalColumnsWidth = colWidths.reduce((sum, w) => sum + w, 0);
   const width =
     CANVAS_PADDING * 2 +
-    layers.length * NODE_WIDTH +
-    Math.max(0, layers.length - 1) * LAYER_GAP;
+    totalColumnsWidth +
+    Math.max(0, nonEmptyLayers.length - 1) * LAYER_GAP;
   const height = CANVAS_PADDING * 2 + maxColumnHeight;
 
   return {
     nodes: positionedNodes,
-    edges: routedEdges,
-    nodeById: positionedById,
+    edges: [],
+    nodeById,
     width,
     height,
-    layerCount: layers.length,
+    layerCount: nonEmptyLayers.length,
+    busTrunks: [],
+    junctions: [],
   };
 }
 
-function compareNodes(a: SignalNodeSnapshot, b: SignalNodeSnapshot): number {
-  const kindDiff = KIND_ORDER[a.kind] - KIND_ORDER[b.kind];
-  if (kindDiff !== 0) return kindDiff;
-  return a.id - b.id;
-}
-
-function indexLayer(
-  layerNodes: ReadonlyArray<SignalNodeSnapshot>,
-): Map<number, number> {
-  const map = new Map<number, number>();
-  for (let i = 0; i < layerNodes.length; i++) {
-    map.set(layerNodes[i]!.id, i);
+export function computeGraphLayout(
+  nodes: ReadonlyArray<SignalNodeSnapshot>,
+  edges: ReadonlyArray<SignalEdgeSnapshot>,
+): GraphLayout {
+  if (nodes.length === 0) {
+    return {
+      nodes: [],
+      edges: [],
+      nodeById: new Map(),
+      width: CANVAS_PADDING * 2,
+      height: CANVAS_PADDING * 2,
+      layerCount: 0,
+      busTrunks: [],
+      junctions: [],
+    };
   }
-  return map;
-}
 
-function sortLayerByBarycenter(
-  layerNodes: SignalNodeSnapshot[],
-  adjacency: ReadonlyMap<number, ReadonlyArray<number>>,
-  neighborIndices: ReadonlyMap<number, number>,
-): void {
-  const originalOrder = indexLayer(layerNodes);
-  layerNodes.sort((a, b) => {
-    const scoreA = computeBarycenter(
-      a.id,
-      adjacency,
-      neighborIndices,
-      originalOrder.get(a.id) ?? 0,
-    );
-    const scoreB = computeBarycenter(
-      b.id,
-      adjacency,
-      neighborIndices,
-      originalOrder.get(b.id) ?? 0,
-    );
-    if (scoreA !== scoreB) return scoreA - scoreB;
-    return compareNodes(a, b);
+  const nodeMap = new Map<number, SignalNodeSnapshot>();
+  const metaById = new Map<number, PreparedNodeMeta>();
+  for (const node of nodes) {
+    nodeMap.set(node.id, node);
+    metaById.set(node.id, prepareNodeMeta(node));
+  }
+
+  const validEdges: SignalEdgeSnapshot[] = [];
+  for (const edge of edges) {
+    if (edge.sourceId === edge.sinkId) continue;
+    if (!nodeMap.has(edge.sourceId) || !nodeMap.has(edge.sinkId)) continue;
+    validEdges.push(edge);
+  }
+
+  const minLayerHintById = computeSemanticLayerHints(
+    nodes,
+    nodeMap,
+    validEdges,
+  );
+
+  // Preserve State / unread Computed / idle Watcher column alignment when graph has no edges
+  if (validEdges.length === 0) {
+    return layoutDisconnectedColumns(nodes, metaById, minLayerHintById);
+  }
+
+  const layoutNodes: LayoutNodeInput[] = nodes.map((node) => {
+    const meta = metaById.get(node.id)!;
+    const minLayerHint = minLayerHintById.get(node.id) ?? 0;
+    return {
+      id: node.id,
+      width: meta.width,
+      height: meta.height,
+      sortGroup: KIND_ORDER[node.kind],
+      minLayerHint,
+    };
   });
-}
 
-function computeBarycenter(
-  nodeId: number,
-  adjacency: ReadonlyMap<number, ReadonlyArray<number>>,
-  neighborIndices: ReadonlyMap<number, number>,
-  fallbackIndex: number,
-): number {
-  const neighbors = adjacency.get(nodeId) ?? [];
-  let sum = 0;
-  let count = 0;
-  for (const neighborId of neighbors) {
-    const idx = neighborIndices.get(neighborId);
-    if (idx !== undefined) {
-      sum += idx;
-      count += 1;
-    }
-  }
-  return count > 0 ? sum / count : fallbackIndex;
-}
+  const seenEdgePairCount = new Map<string, number>();
+  const edgeSourceById = new Map<string, number>();
+  const layoutEdges: LayoutEdgeInput[] = validEdges.map((edge) => {
+    const baseKey = `${edge.sourceId}->${edge.sinkId}`;
+    const count = (seenEdgePairCount.get(baseKey) ?? 0) + 1;
+    seenEdgePairCount.set(baseKey, count);
+    const id = count === 1 ? baseKey : `${baseKey}:${count}`;
+    edgeSourceById.set(id, edge.sourceId);
 
-function buildEdgePath(x1: number, y1: number, x2: number, y2: number): string {
-  if (x2 >= x1) {
-    const dx = Math.max(36, (x2 - x1) * 0.5);
-    return `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
+    const srcKind = nodeMap.get(edge.sourceId)?.kind;
+    const dstKind = nodeMap.get(edge.sinkId)?.kind;
+    const priority =
+      srcKind === "state" && dstKind !== "state"
+        ? 3
+        : dstKind === "watcher" && srcKind !== "watcher"
+          ? 2
+          : 1;
+
+    return {
+      id,
+      sourceId: edge.sourceId,
+      targetId: edge.sinkId,
+      priority,
+      busGroupKey: `fanout:${edge.sourceId}`,
+      weight: 1,
+      minSpan: 1,
+    };
+  });
+
+  const rawLayout = computeHierarchicLayout(layoutNodes, layoutEdges, {
+    padding: CANVAS_PADDING,
+    minLayerGap: LAYER_GAP,
+    nodeSpacingY: ROW_GAP,
+    componentGap: 56,
+    busThreshold: DEFAULT_BUS_THRESHOLD,
+    cornerRadius: 8,
+    uniformColumnWidth: true,
+  });
+
+  const positionedNodes: PositionedNode[] = [];
+  const nodeById = new Map<number, PositionedNode>();
+
+  for (const pn of rawLayout.nodes) {
+    const meta = metaById.get(pn.id)!;
+    const positioned: PositionedNode = {
+      node: meta.node,
+      layer: pn.layer,
+      row: pn.row,
+      x: pn.x,
+      y: pn.y,
+      width: pn.width,
+      height: pn.height,
+      formattedTitle: meta.formattedTitle,
+      formattedTitleLines: meta.formattedTitleLines,
+      subtitleLabel: meta.subtitleLabel,
+      isCompact: meta.isCompact,
+      componentIndex: pn.componentIndex,
+      isIsolated: pn.isIsolated,
+    };
+    positionedNodes.push(positioned);
+    nodeById.set(pn.id, positioned);
   }
-  // Back-edge arc above/below nodes in rare cycle cases
-  const loopOffset = 56;
-  const topY = Math.min(y1, y2) - loopOffset;
-  return `M ${x1} ${y1} C ${x1 + 48} ${topY}, ${x2 - 48} ${topY}, ${x2} ${y2}`;
+
+  const routedEdges: RoutedEdge[] = rawLayout.edges.map((re) => ({
+    id: re.id,
+    sourceId: re.sourceId,
+    sinkId: re.targetId,
+    x1: re.x1,
+    y1: re.y1,
+    x2: re.x2,
+    y2: re.y2,
+    path: re.path,
+    points: re.points,
+    isFeedback: re.isFeedback,
+    isBusMember: re.isBusMember,
+    busGroupKey: re.busGroupKey,
+  }));
+
+  const trunkKindByKey = new Map<string, SignalKind>();
+  const busTrunks: BusTrunkSegment[] = rawLayout.busTrunks.map((bt) => {
+    const firstMemberId = bt.memberEdgeIds[0];
+    const origSourceId =
+      firstMemberId !== undefined
+        ? edgeSourceById.get(firstMemberId)
+        : undefined;
+    const kind: SignalKind =
+      nodeMap.get(bt.sourceId)?.kind ??
+      (origSourceId !== undefined
+        ? nodeMap.get(origSourceId)?.kind
+        : undefined) ??
+      "state";
+    trunkKindByKey.set(bt.busGroupKey, kind);
+    return {
+      busGroupKey: bt.busGroupKey,
+      layerIndex: bt.layerIndex,
+      sourceId: bt.sourceId,
+      kind,
+      x: bt.x,
+      yStart: bt.yStart,
+      yEnd: bt.yEnd,
+      path: bt.path,
+      memberEdgeIds: bt.memberEdgeIds,
+    };
+  });
+
+  const junctions: BusJunctionPoint[] = rawLayout.junctions.map((j) => ({
+    x: j.x,
+    y: j.y,
+    kind: trunkKindByKey.get(j.busGroupKey) ?? "state",
+    busGroupKey: j.busGroupKey,
+  }));
+
+  return {
+    nodes: positionedNodes,
+    edges: routedEdges,
+    nodeById,
+    width: rawLayout.width,
+    height: rawLayout.height,
+    layerCount: rawLayout.layerCount,
+    busTrunks,
+    junctions,
+  };
 }

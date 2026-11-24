@@ -1,95 +1,108 @@
 import type { SourceLocation } from "../protocol/types.ts";
+import {
+  captureCallsite as captureSharedCallsite,
+  compileIgnoreMatchers as compileSharedIgnoreMatchers,
+  parseStackLocation as parseSharedStackLocation,
+  stripTopStackFrames,
+} from "../shared/stack.ts";
 
 const DEFAULT_IGNORED_PATTERNS: ReadonlyArray<RegExp> = [
   /\/node_modules\//,
   /^chrome-extension:\/\//,
-  /tc39-signals-devtools\/src\/(hook|client)\//,
+  /tc39-signals-devtools\/src\/(hook|client|shared)\//,
 ];
 
-const V8_FRAME_WITH_FN =
-  /^\s*at\s+(?:async\s+)?(.+?)\s+\((.+):(\d+):(\d+)\)\s*$/;
-const V8_FRAME_BARE = /^\s*at\s+(?:async\s+)?(.+):(\d+):(\d+)\s*$/;
+const INTERNAL_CALLER_PATH_RE = /@lit-labs[\\/_]signals/i;
+
+const SIGNALS_INTERNAL_FN = (fn: string): boolean =>
+  fn.includes("__SIGNALS_DEVTOOLS__") ||
+  fn.startsWith("new Instrumented") ||
+  fn.includes("Instrumented") ||
+  fn.includes("buildInstrumentedNamespace") ||
+  fn.includes("wrappedComputation") ||
+  fn.includes("wrappedNotify") ||
+  fn.includes("captureCallsite") ||
+  fn.includes("SignalsHookEngine") ||
+  fn === "signalSetFn";
+
+export interface CallsiteCaptureInfo {
+  readonly site: SourceLocation | null;
+  readonly fromInternalPackage: boolean;
+}
 
 export function compileIgnoreMatchers(
   extraPatterns: ReadonlyArray<string>,
 ): ReadonlyArray<RegExp> {
-  const matchers = [...DEFAULT_IGNORED_PATTERNS];
-  for (const raw of extraPatterns) {
-    try {
-      matchers.push(new RegExp(raw));
-    } catch {
-      // Ignore invalid caller regex pattern strings without breaking capture
-    }
-  }
-  return matchers;
+  return [
+    ...DEFAULT_IGNORED_PATTERNS,
+    ...compileSharedIgnoreMatchers(extraPatterns),
+  ];
 }
 
 export function parseStackLocation(
   stack: string | undefined,
-  ignoredMatchers: ReadonlyArray<RegExp>,
+  ignoredMatchers: ReadonlyArray<RegExp> = DEFAULT_IGNORED_PATTERNS,
   skipFrames = 0,
 ): SourceLocation | null {
-  if (!stack) return null;
-  const lines = stack.split("\n");
-  let skipped = 0;
+  return parseSharedStackLocation(stack, {
+    ignoredMatchers,
+    internalFnTest: SIGNALS_INTERNAL_FN,
+    skipFrames,
+    normalizeInitializerFrames: true,
+  });
+}
 
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
-    if (!line.startsWith("at ")) continue;
-    if (skipped < skipFrames) {
-      skipped++;
-      continue;
-    }
-
-    let fn: string | null = null;
-    let file: string;
-    let lineNum: number;
-    let colNum: number;
-
-    const withFn = V8_FRAME_WITH_FN.exec(line);
-    if (withFn) {
-      fn = withFn[1] ?? null;
-      file = withFn[2] ?? "";
-      lineNum = Number(withFn[3]);
-      colNum = Number(withFn[4]);
-    } else {
-      const bare = V8_FRAME_BARE.exec(line);
-      if (!bare) continue;
-      file = bare[1] ?? "";
-      lineNum = Number(bare[2]);
-      colNum = Number(bare[3]);
-    }
-
-    if (!file || file.startsWith("node:internal") || file === "<anonymous>") {
-      continue;
-    }
-
-    if (ignoredMatchers.some((re) => re.test(file))) {
-      continue;
-    }
-
-    if (
-      fn &&
-      (fn.includes("__SIGNALS_DEVTOOLS__") || fn.startsWith("new Instrumented"))
-    ) {
-      continue;
-    }
-
-    return {
-      file,
-      line: Number.isFinite(lineNum) ? lineNum : 0,
-      column: Number.isFinite(colNum) ? colNum : 0,
-      fn,
-    };
+export function parseCallsiteInfo(
+  stack: string | undefined,
+  ignoredMatchers: ReadonlyArray<RegExp> = DEFAULT_IGNORED_PATTERNS,
+  skipFrames = 0,
+): CallsiteCaptureInfo {
+  let fromInternalPackage = false;
+  const site = parseSharedStackLocation(stack, {
+    ignoredMatchers,
+    internalFnTest: SIGNALS_INTERNAL_FN,
+    skipFrames,
+    normalizeInitializerFrames: true,
+    onIgnoredFrame({ file }) {
+      if (INTERNAL_CALLER_PATH_RE.test(file)) {
+        fromInternalPackage = true;
+      }
+    },
+  });
+  if (site && INTERNAL_CALLER_PATH_RE.test(site.file)) {
+    fromInternalPackage = true;
   }
+  return { site, fromInternalPackage };
+}
 
-  return null;
+export function parseDirectCallerStack(
+  stack: string | undefined,
+  ignoredMatchers: ReadonlyArray<RegExp> = DEFAULT_IGNORED_PATTERNS,
+): SourceLocation | null {
+  return parseSharedStackLocation(stripTopStackFrames(stack, 1), {
+    ignoredMatchers,
+    internalFnTest: SIGNALS_INTERNAL_FN,
+    skipFrames: 0,
+    normalizeInitializerFrames: true,
+  });
 }
 
 export function captureCallsite(
-  ignoredMatchers: ReadonlyArray<RegExp>,
-  skipFrames = 1,
+  ignoredMatchers: ReadonlyArray<RegExp> = DEFAULT_IGNORED_PATTERNS,
+  skipFrames = 0,
 ): SourceLocation | null {
-  const stack = new Error().stack;
-  return parseStackLocation(stack, ignoredMatchers, skipFrames);
+  return captureSharedCallsite({
+    ignoredMatchers,
+    internalFnTest: SIGNALS_INTERNAL_FN,
+    skipFrames,
+    normalizeInitializerFrames: true,
+  });
+}
+
+export function captureCallsiteInfo(
+  ignoredMatchers: ReadonlyArray<RegExp> = DEFAULT_IGNORED_PATTERNS,
+  skipFrames = 0,
+): CallsiteCaptureInfo {
+  const stack = stripTopStackFrames(new Error().stack, 1);
+  return parseCallsiteInfo(stack, ignoredMatchers, skipFrames);
 }

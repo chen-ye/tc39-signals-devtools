@@ -2,17 +2,30 @@ import {
   BRIDGE_CHANNEL,
   isValidActionResult,
   isValidGraphSnapshot,
+  type ActionResult,
   type BackgroundToPanelMessage,
   type PanelToBackgroundMessage,
+  type SourceLocation,
 } from "../protocol/types.ts";
+import {
+  createBasePanelTransport,
+  isChromeDevToolsContext,
+  type BasePanelTransport,
+  type PanelTransportMode,
+} from "../shared/panel-transport.ts";
+import { openSourceLocation } from "../shared/source-jump.ts";
 
-export interface PanelTransport {
-  readonly mode: "devtools" | "bridge";
-  send(message: PanelToBackgroundMessage): void;
-  onMessage(listener: (message: BackgroundToPanelMessage) => void): () => void;
+export { isChromeDevToolsContext };
+
+export interface PanelTransport extends BasePanelTransport<
+  BackgroundToPanelMessage,
+  PanelToBackgroundMessage
+> {
   reloadPage(): void;
-  getDevToolsTheme(): "light" | "dark" | null;
-  dispose(): void;
+  openSource(
+    nodeId: number,
+    site: SourceLocation | null,
+  ): Promise<ActionResult>;
 }
 
 function isBackgroundMessage(
@@ -48,174 +61,63 @@ function isBackgroundMessage(
   }
 }
 
-export function isChromeDevToolsContext(): boolean {
-  return (
-    typeof chrome !== "undefined" &&
-    typeof chrome.devtools !== "undefined" &&
-    typeof chrome.devtools.inspectedWindow?.tabId === "number"
-  );
+function createSignalsPanelTransport(
+  mode?: PanelTransportMode,
+): PanelTransport {
+  const base = createBasePanelTransport<
+    BackgroundToPanelMessage,
+    PanelToBackgroundMessage
+  >({
+    channel: BRIDGE_CHANNEL,
+    isIncomingMessage: isBackgroundMessage,
+    mode,
+    pingMessage: { type: "PING" },
+    initialBridgeMessage: { type: "START_INSPECTION" },
+    createNavigatedMessage: (url) => ({ type: "PAGE_NAVIGATING", url }),
+  });
+
+  if (base.mode === "devtools") {
+    return {
+      ...base,
+      reloadPage() {
+        chrome.devtools.inspectedWindow.reload({});
+      },
+      openSource(nodeId, site) {
+        const validNodeId = Number.isSafeInteger(nodeId) && nodeId >= 1;
+        const evalInspectTargetExpr = validNodeId
+          ? `globalThis.__SIGNALS_DEVTOOLS_HOOK__?.getTargetFunction?.(${nodeId})`
+          : undefined;
+        return openSourceLocation({
+          mode: "devtools",
+          site,
+          evalInspectTargetExpr,
+        });
+      },
+    };
+  }
+
+  return {
+    ...base,
+    reloadPage() {
+      base.send({ type: "REQUEST_SNAPSHOT" });
+    },
+    openSource(_nodeId, site) {
+      return openSourceLocation({
+        mode: "bridge",
+        site,
+      });
+    },
+  };
 }
 
 export function createChromeDevtoolsTransport(): PanelTransport {
-  const tabId = chrome.devtools.inspectedWindow.tabId;
-  const listeners = new Set<(message: BackgroundToPanelMessage) => void>();
-  let port: chrome.runtime.Port | null = null;
-  let disposed = false;
-  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-
-  const emit = (msg: BackgroundToPanelMessage) => {
-    for (const listener of listeners) {
-      listener(msg);
-    }
-  };
-
-  const connect = () => {
-    if (disposed) return;
-    const nextPort = chrome.runtime.connect({ name: `devtools:${tabId}` });
-    port = nextPort;
-
-    nextPort.onMessage.addListener((raw: unknown) => {
-      if (isBackgroundMessage(raw)) {
-        emit(raw);
-      }
-    });
-
-    nextPort.onDisconnect.addListener(() => {
-      if (port === nextPort) {
-        port = null;
-      }
-      if (!disposed && reconnectTimer === null) {
-        reconnectTimer = setTimeout(() => {
-          reconnectTimer = null;
-          connect();
-        }, 250);
-      }
-    });
-  };
-
-  // Connect after synchronous caller registers onMessage() listeners so initial PAGE_CONNECTED/SNAPSHOT never races.
-  queueMicrotask(connect);
-
-  heartbeatTimer = setInterval(() => {
-    if (port && !disposed) {
-      try {
-        port.postMessage({ type: "PING" } satisfies PanelToBackgroundMessage);
-      } catch {
-        // Ignore transient disconnect; onDisconnect handles reconnection
-      }
-    }
-  }, 18_000);
-
-  const onNavigated = (url: string) => {
-    emit({ type: "PAGE_NAVIGATING", url });
-  };
-  chrome.devtools.network?.onNavigated?.addListener(onNavigated);
-
-  return {
-    mode: "devtools",
-    send(message) {
-      if (disposed) return;
-      if (!port) connect();
-      try {
-        port?.postMessage(message);
-      } catch {
-        port = null;
-        connect();
-      }
-    },
-    onMessage(listener) {
-      listeners.add(listener);
-      return () => {
-        listeners.delete(listener);
-      };
-    },
-    reloadPage() {
-      chrome.devtools.inspectedWindow.reload({});
-    },
-    getDevToolsTheme() {
-      const theme = chrome.devtools.panels.themeName;
-      return theme === "dark" ? "dark" : "light";
-    },
-    dispose() {
-      disposed = true;
-      if (reconnectTimer !== null) {
-        clearTimeout(reconnectTimer);
-        reconnectTimer = null;
-      }
-      if (heartbeatTimer !== null) {
-        clearInterval(heartbeatTimer);
-        heartbeatTimer = null;
-      }
-      chrome.devtools.network?.onNavigated?.removeListener(onNavigated);
-      port?.disconnect();
-      port = null;
-      listeners.clear();
-    },
-  };
+  return createSignalsPanelTransport("devtools");
 }
 
 export function createWindowBridgeTransport(): PanelTransport {
-  const listeners = new Set<(message: BackgroundToPanelMessage) => void>();
-  const target: Window | null =
-    window.opener ?? (window.parent !== window ? window.parent : null);
-
-  const onWindowMessage = (event: MessageEvent) => {
-    if (target && event.source !== target) return;
-    if (!target && event.source !== window) return;
-    const data: unknown = event.data;
-    if (data === null || typeof data !== "object") return;
-    if (Reflect.get(data, "channel") !== BRIDGE_CHANNEL) return;
-    if (Reflect.get(data, "direction") !== "host-to-panel") return;
-    const payload: unknown = Reflect.get(data, "payload");
-    if (isBackgroundMessage(payload)) {
-      for (const listener of listeners) {
-        listener(payload);
-      }
-    }
-  };
-
-  window.addEventListener("message", onWindowMessage);
-
-  const postToHost = (message: PanelToBackgroundMessage) => {
-    target?.postMessage(
-      {
-        channel: BRIDGE_CHANNEL,
-        direction: "panel-to-host",
-        payload: message,
-      },
-      "*",
-    );
-  };
-
-  postToHost({ type: "START_INSPECTION" });
-
-  return {
-    mode: "bridge",
-    send(message) {
-      postToHost(message);
-    },
-    onMessage(listener) {
-      listeners.add(listener);
-      return () => {
-        listeners.delete(listener);
-      };
-    },
-    reloadPage() {
-      postToHost({ type: "REQUEST_SNAPSHOT" });
-    },
-    getDevToolsTheme() {
-      return null;
-    },
-    dispose() {
-      window.removeEventListener("message", onWindowMessage);
-      listeners.clear();
-    },
-  };
+  return createSignalsPanelTransport("bridge");
 }
 
 export function createPanelTransport(): PanelTransport {
-  return isChromeDevToolsContext()
-    ? createChromeDevtoolsTransport()
-    : createWindowBridgeTransport();
+  return createSignalsPanelTransport();
 }

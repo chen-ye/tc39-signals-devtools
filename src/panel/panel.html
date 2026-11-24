@@ -9,7 +9,12 @@
     <link rel="stylesheet" href="panel.css" />
   </head>
   <body>
-    <div class="panel-shell" id="panel-shell">
+    <div
+      class="panel-shell"
+      id="panel-shell"
+      data-empty="true"
+      data-bottom-collapsed="false"
+    >
       <header class="panel-header">
         <div class="toolbar" role="toolbar" aria-label="Signal graph controls">
           <div class="search-wrap">
@@ -41,11 +46,59 @@
               id="search-input"
               class="search-input"
               data-testid="search-input"
-              placeholder="Filter by name, #id, value, file…"
-              aria-label="Filter signals by name, id, value, or file"
+              placeholder="Highlight / filter (kind:, runtime:, is:)…"
+              aria-label="Highlight or filter signals by name, id, value, kind:, runtime:, file:, or is:"
               autocomplete="off"
               spellcheck="false"
             />
+            <div class="search-nav-group" id="search-nav-group" hidden>
+              <span
+                class="search-match-count"
+                id="search-match-count"
+                data-testid="search-match-count"
+                >0/0</span
+              >
+              <button
+                type="button"
+                class="search-step-btn"
+                id="search-prev-btn"
+                data-testid="search-prev-btn"
+                aria-label="Previous match"
+                title="Previous match (Shift+Enter)"
+              >
+                ↑
+              </button>
+              <button
+                type="button"
+                class="search-step-btn"
+                id="search-next-btn"
+                data-testid="search-next-btn"
+                aria-label="Next match"
+                title="Next match (Enter)"
+              >
+                ↓
+              </button>
+              <button
+                type="button"
+                class="search-step-btn"
+                id="search-clear-btn"
+                data-testid="search-clear-btn"
+                aria-label="Clear search"
+                title="Clear search"
+              >
+                ×
+              </button>
+            </div>
+            <button
+              type="button"
+              class="search-mode-btn"
+              id="search-mode-btn"
+              data-testid="search-mode-btn"
+              aria-pressed="false"
+              title="Toggle Highlight vs Filter search mode"
+            >
+              Highlight
+            </button>
           </div>
 
           <span class="toolbar-sep" aria-hidden="true"></span>
@@ -157,6 +210,46 @@
             <span>Errors</span>
             <span id="filter-errors-count" class="pill-count">0</span>
           </button>
+
+          <button
+            type="button"
+            id="toggle-internal"
+            class="tool-btn"
+            data-testid="toggle-internal"
+            aria-pressed="false"
+            hidden
+            title="Show internal signals (e.g. __forceUpdateSignal)"
+          >
+            <span>Internal</span>
+            <span
+              id="toggle-internal-count"
+              data-testid="toggle-internal-count"
+              class="pill-count"
+              >0</span
+            >
+          </button>
+
+          <div class="runtimes-dropdown-wrap" id="runtimes-dropdown-wrap">
+            <button
+              type="button"
+              id="runtimes-filter-btn"
+              class="tool-btn runtimes-filter-btn"
+              data-testid="runtimes-filter-btn"
+              aria-expanded="false"
+              aria-controls="runtimes-popover"
+              title="Filter signal runtimes (-runtime:)"
+            >
+              Runtimes ▾
+            </button>
+            <div
+              class="runtimes-popover"
+              id="runtimes-popover"
+              data-testid="runtimes-popover"
+              role="dialog"
+              aria-label="Filter signal runtimes"
+              hidden
+            ></div>
+          </div>
 
           <span class="toolbar-spacer" aria-hidden="true"></span>
 
@@ -355,6 +448,26 @@
                 Reset
               </button>
             </span>
+
+            <div
+              class="focus-breadcrumb"
+              id="focus-breadcrumb"
+              data-testid="focus-breadcrumb"
+              hidden
+            >
+              <span
+                class="focus-breadcrumb-text"
+                id="focus-breadcrumb-label"
+              ></span>
+              <button
+                type="button"
+                class="focus-clear-btn"
+                id="focus-clear-btn"
+                data-testid="focus-clear-btn"
+              >
+                Show full graph
+              </button>
+            </div>
           </div>
 
           <div class="status-right" data-testid="site-toggle-bar">
@@ -488,7 +601,7 @@ export default defineConfig({ plugins: [signalsDevtoolsPlugin()] });</code></pre
             hidden
           >
             <div class="filter-empty-card">
-              <p class="filter-empty-title">
+              <p class="filter-empty-title" id="filter-empty-title">
                 No signals match the active filters
               </p>
               <p class="filter-empty-sub" id="filter-empty-sub"></p>
@@ -620,6 +733,16 @@ export default defineConfig({ plugins: [signalsDevtoolsPlugin()] });</code></pre
           </button>
         </div>
 
+        <div
+          class="splitter splitter-vertical"
+          id="splitter-right"
+          data-testid="splitter-right"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize right inspector pane"
+          tabindex="0"
+        ></div>
+
         <aside
           class="inspector-pane"
           id="inspector-pane"
@@ -634,6 +757,16 @@ export default defineConfig({ plugins: [signalsDevtoolsPlugin()] });</code></pre
           </div>
           <div class="inspector-body" id="inspector-body"></div>
         </aside>
+
+        <div
+          class="splitter splitter-horizontal"
+          id="splitter-bottom"
+          data-testid="splitter-bottom"
+          role="separator"
+          aria-orientation="horizontal"
+          aria-label="Resize bottom timeline pane"
+          tabindex="0"
+        ></div>
 
         <section
           class="timeline-pane"

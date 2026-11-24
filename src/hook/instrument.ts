@@ -19,14 +19,123 @@ import type {
   ValuePreview,
 } from "../protocol/types.ts";
 import { formatErrorMessage, serializePreview } from "./preview.ts";
-import { captureCallsite, compileIgnoreMatchers } from "./stack.ts";
+import {
+  detectInternalSignal,
+  extractComputedExpression,
+  extractOwnerLabelFromSite,
+  getFunctionSource,
+  inferAutoSignalLabel,
+} from "./expression.ts";
+import {
+  captureCallsite,
+  captureCallsiteInfo,
+  compileIgnoreMatchers,
+  parseDirectCallerStack,
+} from "./stack.ts";
 
 const MAX_EVENT_HISTORY = 500;
+
+type TargetFn = (...args: never[]) => unknown;
+
+function isTargetFn(value: unknown): value is TargetFn {
+  return typeof value === "function";
+}
+
+function asTargetFn(value: unknown): TargetFn | null {
+  return isTargetFn(value) ? value : null;
+}
+
+function isDevtoolsWrapperFn(fn: TargetFn): boolean {
+  if (fn.name.includes("__SIGNALS_DEVTOOLS__")) return true;
+  try {
+    return Function.prototype.toString
+      .call(fn)
+      .includes("__SIGNALS_DEVTOOLS__");
+  } catch {
+    return false;
+  }
+}
+
+function extractPolyfillTargetFunction(
+  instance: object,
+  kind: "computed" | "watcher",
+): TargetFn | null {
+  try {
+    const propName =
+      kind === "computed" ? "computation" : "consumerMarkedDirty";
+    for (const sym of Object.getOwnPropertySymbols(instance)) {
+      const internalNode: unknown = Reflect.get(instance, sym);
+      if (internalNode === null || typeof internalNode !== "object") {
+        continue;
+      }
+      const candidate: unknown = Reflect.get(internalNode, propName);
+      const fn = asTargetFn(candidate);
+      if (fn && !isDevtoolsWrapperFn(fn)) {
+        return fn;
+      }
+    }
+  } catch {
+    // Defensive: inspecting foreign signal internals must never throw
+  }
+  return null;
+}
+
+function buildRegisteredComputedCreateMeta(instance: object) {
+  const rawFn = extractPolyfillTargetFunction(instance, "computed");
+  const expr = rawFn ? extractComputedExpression(rawFn) : null;
+  const rawFnSource = expr?.source ?? getFunctionSource(rawFn);
+  const autoLabel = inferAutoSignalLabel({
+    kind: "computed",
+    site: null,
+    exprFnName: expr?.fnName ?? null,
+    exprSummary: expr?.summary ?? null,
+  });
+  const internal = detectInternalSignal({
+    label: null,
+    site: null,
+    fnSource: rawFnSource,
+  });
+  return {
+    autoLabel,
+    computeSource: expr?.source ?? null,
+    computeSignature: expr?.signature ?? null,
+    internal,
+    ...(rawFn ? { targetFnRef: new WeakRef(rawFn) } : {}),
+  };
+}
+
+function buildRegisteredWatcherCreateMeta(instance: object) {
+  const rawNotify = extractPolyfillTargetFunction(instance, "watcher");
+  const notifyExpr = rawNotify ? extractComputedExpression(rawNotify) : null;
+  const notifySource = notifyExpr?.source ?? getFunctionSource(rawNotify);
+  const autoLabel = inferAutoSignalLabel({
+    kind: "watcher",
+    site: null,
+    exprFnName: notifyExpr?.fnName ?? null,
+  });
+  const internal = detectInternalSignal({
+    label: null,
+    site: null,
+    fnSource: notifySource,
+  });
+  return {
+    autoLabel,
+    internal,
+    ...(rawNotify ? { targetFnRef: new WeakRef(rawNotify) } : {}),
+  };
+}
 
 interface BaseNodeRecord {
   readonly id: number;
   readonly kind: SignalKind;
   label: string | null;
+  autoLabel?: string | null;
+  ownerLabel?: string | null;
+  computeSource?: string | null;
+  computeSignature?: string | null;
+  internal?: boolean;
+  fromInternalPackage?: boolean;
+  targetFnRef?: WeakRef<TargetFn>;
   readonly runtime: string;
   readonly runtimeMode: RuntimeMode;
   readonly signalApi: SignalNamespace;
@@ -73,6 +182,10 @@ interface PendingComputedEval {
   equalsChecked: boolean;
 }
 
+interface PendingWriteSiteEntry {
+  readonly site: SourceLocation | null;
+}
+
 interface RegisteredRuntimeEntry {
   readonly id: number;
   readonly name: string;
@@ -85,6 +198,13 @@ type CreateRecordParams =
       readonly kind: "state";
       readonly instance: SignalStateInstance;
       readonly label: string | null;
+      readonly autoLabel?: string | null;
+      readonly ownerLabel?: string | null;
+      readonly computeSource?: string | null;
+      readonly computeSignature?: string | null;
+      readonly internal?: boolean;
+      readonly fromInternalPackage?: boolean;
+      readonly targetFnRef?: WeakRef<TargetFn>;
       readonly runtime: string;
       readonly runtimeMode: RuntimeMode;
       readonly signalApi: SignalNamespace;
@@ -96,6 +216,13 @@ type CreateRecordParams =
       readonly kind: "computed";
       readonly instance: SignalComputedInstance;
       readonly label: string | null;
+      readonly autoLabel?: string | null;
+      readonly ownerLabel?: string | null;
+      readonly computeSource?: string | null;
+      readonly computeSignature?: string | null;
+      readonly internal?: boolean;
+      readonly fromInternalPackage?: boolean;
+      readonly targetFnRef?: WeakRef<TargetFn>;
       readonly runtime: string;
       readonly runtimeMode: RuntimeMode;
       readonly signalApi: SignalNamespace;
@@ -107,6 +234,13 @@ type CreateRecordParams =
       readonly kind: "watcher";
       readonly instance: SignalWatcherInstance;
       readonly label: string | null;
+      readonly autoLabel?: string | null;
+      readonly ownerLabel?: string | null;
+      readonly computeSource?: string | null;
+      readonly computeSignature?: string | null;
+      readonly internal?: boolean;
+      readonly fromInternalPackage?: boolean;
+      readonly targetFnRef?: WeakRef<TargetFn>;
       readonly runtime: string;
       readonly runtimeMode: RuntimeMode;
       readonly signalApi: SignalNamespace;
@@ -137,6 +271,9 @@ interface InstrumentationCallbacks {
   ): void;
   setPendingEval(target: object, pending: PendingComputedEval): void;
   takePendingEval(target: object): PendingComputedEval | undefined;
+  pushPendingWriteSite(target: object, entry: PendingWriteSiteEntry): void;
+  consumePendingWriteSite(target: object): PendingWriteSiteEntry | undefined;
+  popPendingWriteSite(target: object, entry: PendingWriteSiteEntry): void;
   flushPendingSourceSync(): void;
   syncNodeSources(
     record: NodeRecord,
@@ -159,13 +296,26 @@ function buildInstrumentedNamespace(
       const userEquals = options?.equals;
       const wrappedOptions: SignalOptions<V> = {
         ...options,
-        equals(this: unknown, prev: V, next: V): boolean {
+        equals: function __SIGNALS_DEVTOOLS__stateEquals(
+          this: unknown,
+          prev: V,
+          next: V,
+        ): boolean {
+          const target =
+            typeof this === "object" && this !== null ? this : undefined;
+          const pendingWrite = target
+            ? cb.consumePendingWriteSite(target)
+            : undefined;
+          const writeSite = pendingWrite
+            ? pendingWrite.site
+            : cb.getSettings().writeStacks
+              ? captureCallsite(cb.getIgnoreMatchers(), 0)
+              : null;
+
           const isEqual = userEquals
             ? Reflect.apply(userEquals, this, [prev, next])
             : Object.is(prev, next);
 
-          const target =
-            typeof this === "object" && this !== null ? this : undefined;
           const record = target ? cb.getRecord(target) : undefined;
           if (record) {
             const changed = !isEqual;
@@ -179,10 +329,6 @@ function buildInstrumentedNamespace(
               record.changeSeq = seq;
               record.lastChangedSeq = seq;
             }
-
-            const writeSite = cb.getSettings().writeStacks
-              ? captureCallsite(cb.getIgnoreMatchers(), 1)
-              : null;
 
             cb.pushEvent({
               seq,
@@ -206,11 +352,25 @@ function buildInstrumentedNamespace(
         typeof options?.name === "string" && options.name.trim()
           ? options.name.trim()
           : null;
-      const site = captureCallsite(cb.getIgnoreMatchers(), 2);
+      const { site, fromInternalPackage } = captureCallsiteInfo(
+        cb.getIgnoreMatchers(),
+        0,
+      );
+      const ownerLabel = extractOwnerLabelFromSite(site);
+      const autoLabel = inferAutoSignalLabel({ kind: "state", site });
+      const internal = detectInternalSignal({
+        label,
+        site,
+        fromInternalPackage,
+      });
       const record = cb.createRecord({
         instance: this,
         kind: "state",
         label,
+        autoLabel,
+        ownerLabel,
+        internal,
+        fromInternalPackage,
         runtime: runtimeName,
         runtimeMode: "instrumented",
         signalApi,
@@ -231,7 +391,22 @@ function buildInstrumentedNamespace(
     }
 
     override set(newValue: V): void {
-      super.set(newValue);
+      let writeEntry: PendingWriteSiteEntry | null = null;
+      if (cb.getSettings().writeStacks) {
+        const callerSite = parseDirectCallerStack(
+          new Error().stack,
+          cb.getIgnoreMatchers(),
+        );
+        writeEntry = { site: callerSite };
+        cb.pushPendingWriteSite(this, writeEntry);
+      }
+      try {
+        super.set(newValue);
+      } finally {
+        if (writeEntry) {
+          cb.popPendingWriteSite(this, writeEntry);
+        }
+      }
       const record = cb.getRecord(this);
       if (record) {
         record.live = safeHasSinks(signalApi, this);
@@ -244,8 +419,14 @@ function buildInstrumentedNamespace(
       let lastRawValue: unknown = undefined;
       let hasValidLastValue = false;
       const userEquals = options?.equals;
+      const expr = extractComputedExpression(computation);
+      const rawComputation = asTargetFn(computation);
+      const rawComputationSource =
+        expr?.source ?? getFunctionSource(computation);
 
-      const wrappedComputation = function (this: unknown): V {
+      const wrappedComputation = function __SIGNALS_DEVTOOLS__computedFn(
+        this: unknown,
+      ): V {
         const target =
           typeof this === "object" && this !== null ? this : undefined;
         const record = target ? cb.getRecord(target) : undefined;
@@ -297,7 +478,11 @@ function buildInstrumentedNamespace(
             ...options,
             ...(userEquals
               ? {
-                  equals(this: unknown, prev: V, next: V): boolean {
+                  equals: function __SIGNALS_DEVTOOLS__computedEquals(
+                    this: unknown,
+                    prev: V,
+                    next: V,
+                  ): boolean {
                     const target =
                       typeof this === "object" && this !== null
                         ? this
@@ -348,11 +533,34 @@ function buildInstrumentedNamespace(
         typeof options?.name === "string" && options.name.trim()
           ? options.name.trim()
           : null;
-      const site = captureCallsite(cb.getIgnoreMatchers(), 2);
+      const { site, fromInternalPackage } = captureCallsiteInfo(
+        cb.getIgnoreMatchers(),
+        0,
+      );
+      const ownerLabel = extractOwnerLabelFromSite(site);
+      const autoLabel = inferAutoSignalLabel({
+        kind: "computed",
+        site,
+        exprFnName: expr?.fnName ?? null,
+        exprSummary: expr?.summary ?? null,
+      });
+      const internal = detectInternalSignal({
+        label,
+        site,
+        fnSource: rawComputationSource,
+        fromInternalPackage,
+      });
       const record = cb.createRecord({
         instance: this,
         kind: "computed",
         label,
+        autoLabel,
+        ownerLabel,
+        computeSource: expr?.source ?? null,
+        computeSignature: expr?.signature ?? null,
+        internal,
+        fromInternalPackage,
+        ...(rawComputation ? { targetFnRef: new WeakRef(rawComputation) } : {}),
         runtime: runtimeName,
         runtimeMode: "instrumented",
         signalApi,
@@ -386,7 +594,13 @@ function buildInstrumentedNamespace(
 
   class InstrumentedWatcher extends baseSubtle.Watcher {
     constructor(notify: () => void) {
-      const wrappedNotify = function (this: SignalWatcherInstance): void {
+      const rawNotify = asTargetFn(notify);
+      const notifyExpr = extractComputedExpression(notify);
+      const notifySource = notifyExpr?.source ?? getFunctionSource(notify);
+
+      const wrappedNotify = function __SIGNALS_DEVTOOLS__watcherNotify(
+        this: SignalWatcherInstance,
+      ): void {
         const record = cb.getRecord(this);
         if (record) {
           record.notifies += 1;
@@ -417,11 +631,31 @@ function buildInstrumentedNamespace(
 
       super(wrappedNotify);
 
-      const site = captureCallsite(cb.getIgnoreMatchers(), 2);
+      const { site, fromInternalPackage } = captureCallsiteInfo(
+        cb.getIgnoreMatchers(),
+        0,
+      );
+      const ownerLabel = extractOwnerLabelFromSite(site);
+      const autoLabel = inferAutoSignalLabel({
+        kind: "watcher",
+        site,
+        exprFnName: notifyExpr?.fnName ?? null,
+      });
+      const internal = detectInternalSignal({
+        label: null,
+        site,
+        fnSource: notifySource,
+        fromInternalPackage,
+      });
       const record = cb.createRecord({
         instance: this,
         kind: "watcher",
         label: null,
+        autoLabel,
+        ownerLabel,
+        internal,
+        fromInternalPackage,
+        ...(rawNotify ? { targetFnRef: new WeakRef(rawNotify) } : {}),
         runtime: runtimeName,
         runtimeMode: "instrumented",
         signalApi,
@@ -516,6 +750,7 @@ export class SignalsHookEngine {
   readonly #registeredRuntimes = new Map<number, RegisteredRuntimeEntry>();
   readonly #pendingSourceSync = new Set<number>();
   readonly #pendingComputedEvals = new WeakMap<object, PendingComputedEval>();
+  readonly #pendingWriteSites = new WeakMap<object, PendingWriteSiteEntry[]>();
   readonly #events: SignalEvent[] = [];
   readonly #listeners = new Set<() => void>();
 
@@ -550,6 +785,33 @@ export class SignalsHookEngine {
       const pending = this.#pendingComputedEvals.get(target);
       this.#pendingComputedEvals.delete(target);
       return pending;
+    },
+    pushPendingWriteSite: (target, entry) => {
+      const stack = this.#pendingWriteSites.get(target);
+      if (stack) {
+        stack.push(entry);
+      } else {
+        this.#pendingWriteSites.set(target, [entry]);
+      }
+    },
+    consumePendingWriteSite: (target) => {
+      const stack = this.#pendingWriteSites.get(target);
+      if (!stack || stack.length === 0) return undefined;
+      const entry = stack.pop();
+      if (stack.length === 0) {
+        this.#pendingWriteSites.delete(target);
+      }
+      return entry;
+    },
+    popPendingWriteSite: (target, entry) => {
+      const stack = this.#pendingWriteSites.get(target);
+      if (!stack || stack.length === 0) return;
+      if (stack[stack.length - 1] === entry) {
+        stack.pop();
+        if (stack.length === 0) {
+          this.#pendingWriteSites.delete(target);
+        }
+      }
     },
     flushPendingSourceSync: () => this.#flushPendingSourceSync(),
     syncNodeSources: (record, instance) =>
@@ -643,6 +905,16 @@ export class SignalsHookEngine {
     const record = this.#getRecord(target);
     if (record) {
       record.label = clean.length > 0 ? clean : null;
+      record.internal = detectInternalSignal({
+        label: record.label,
+        site: record.site,
+        fnSource:
+          record.computeSource ??
+          getFunctionSource(record.targetFnRef?.deref()),
+        ...(record.fromInternalPackage !== undefined
+          ? { fromInternalPackage: record.fromInternalPackage }
+          : {}),
+      });
       this.#scheduleNotify();
       return target;
     }
@@ -651,6 +923,21 @@ export class SignalsHookEngine {
       this.#deferredLabels.set(target, clean.length > 0 ? clean : null);
     }
     return target;
+  }
+
+  getTargetFunction(nodeId: number): ((...args: never[]) => unknown) | null {
+    const record = this.#nodesById.get(nodeId);
+    const fn = record?.targetFnRef?.deref();
+    if (typeof fn !== "function") return null;
+    try {
+      const src = Function.prototype.toString.call(fn);
+      if (src.includes("[native code]")) {
+        return null;
+      }
+    } catch {
+      return null;
+    }
+    return fn;
   }
 
   ignoreFrames(...patterns: ReadonlyArray<string>): void {
@@ -806,6 +1093,10 @@ export class SignalsHookEngine {
         id: record.id,
         kind: record.kind,
         label: record.label,
+        ...(record.label === null && record.autoLabel
+          ? { autoLabel: record.autoLabel }
+          : {}),
+        ...(record.ownerLabel ? { ownerLabel: record.ownerLabel } : {}),
         runtime: record.runtime,
         runtimeMode: record.runtimeMode,
         site: record.site,
@@ -819,6 +1110,13 @@ export class SignalsHookEngine {
         lastRunMs: record.lastRunMs,
         lastChangedSeq: record.lastChangedSeq,
         causes: record.causes,
+        ...(record.computeSource
+          ? { computeSource: record.computeSource }
+          : {}),
+        ...(record.computeSignature
+          ? { computeSignature: record.computeSignature }
+          : {}),
+        ...(record.internal ? { internal: true } : {}),
       });
     }
 
@@ -867,9 +1165,31 @@ export class SignalsHookEngine {
       });
     }
 
+    const label = params.label ?? deferredLabel ?? null;
+    const autoLabel = params.autoLabel ?? null;
+    const internal =
+      Boolean(params.internal) ||
+      detectInternalSignal({
+        label,
+        site: params.site,
+        fnSource: params.computeSource ?? null,
+        ...(params.fromInternalPackage !== undefined
+          ? { fromInternalPackage: params.fromInternalPackage }
+          : {}),
+      });
+
     const common = {
       id,
-      label: params.label ?? deferredLabel ?? null,
+      label,
+      ...(autoLabel ? { autoLabel } : {}),
+      ...(params.ownerLabel ? { ownerLabel: params.ownerLabel } : {}),
+      ...(params.computeSource ? { computeSource: params.computeSource } : {}),
+      ...(params.computeSignature
+        ? { computeSignature: params.computeSignature }
+        : {}),
+      ...(internal ? { internal: true } : {}),
+      ...(params.fromInternalPackage ? { fromInternalPackage: true } : {}),
+      ...(params.targetFnRef ? { targetFnRef: params.targetFnRef } : {}),
       runtime: params.runtime,
       runtimeMode: params.runtimeMode,
       signalApi: params.signalApi,
@@ -1072,6 +1392,7 @@ export class SignalsHookEngine {
             instance: src,
             kind: "computed",
             label: null,
+            ...buildRegisteredComputedCreateMeta(src),
             runtime: record.runtime,
             runtimeMode: "registered",
             signalApi: record.signalApi,
@@ -1124,6 +1445,7 @@ export class SignalsHookEngine {
           instance: watcher,
           kind: "watcher",
           label: null,
+          ...buildRegisteredWatcherCreateMeta(watcher),
           runtime: entry.name,
           runtimeMode: "registered",
           signalApi: entry.signalApi,
@@ -1176,6 +1498,7 @@ export class SignalsHookEngine {
               instance: src,
               kind: "computed",
               label: null,
+              ...buildRegisteredComputedCreateMeta(src),
               runtime: entry.name,
               runtimeMode: "registered",
               signalApi: entry.signalApi,

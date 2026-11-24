@@ -1,21 +1,12 @@
 import {
   toMatchPattern,
-  type BackgroundToPanelMessage,
-  type IsolatedToBackgroundMessage,
   type PanelToBackgroundMessage,
-  type PanelToPageMessage,
 } from "../protocol/types.ts";
+import { createBackgroundPortRouter } from "../shared/background-router.ts";
 
 const STORAGE_KEY = "enabledSiteOrigins";
 const POLYFILL_SCRIPT_ID = "tc39-signals-polyfill-provider";
 
-interface TabChannel {
-  content?: chrome.runtime.Port;
-  panel?: chrome.runtime.Port;
-  url: string | null;
-}
-
-const tabs = new Map<number, TabChannel>();
 let toggleSyncQueue: Promise<void> = Promise.resolve();
 
 function enqueueToggleSync<T>(task: () => Promise<T>): Promise<T> {
@@ -71,35 +62,17 @@ async function syncDynamicPolyfillScripts(
   ]);
 }
 
-function sendToPanel(tabId: number, msg: BackgroundToPanelMessage): void {
-  try {
-    tabs.get(tabId)?.panel?.postMessage(msg);
-  } catch {
-    // Port closed mid-send
-  }
-}
-
-function sendToContent(tabId: number, msg: PanelToPageMessage): void {
-  try {
-    tabs.get(tabId)?.content?.postMessage(msg);
-  } catch {
-    // Port closed mid-send
-  }
-}
-
-function isIsolatedMessage(msg: unknown): msg is IsolatedToBackgroundMessage {
+function isPanelToggleMessage(
+  msg: unknown,
+): msg is Extract<
+  PanelToBackgroundMessage,
+  { readonly type: "GET_SITE_TOGGLE" | "SET_SITE_TOGGLE" }
+> {
+  if (msg === null || typeof msg !== "object") return false;
+  const type = Reflect.get(msg, "type");
   return (
-    msg !== null &&
-    typeof msg === "object" &&
-    typeof Reflect.get(msg, "type") === "string"
-  );
-}
-
-function isPanelMessage(msg: unknown): msg is PanelToBackgroundMessage {
-  return (
-    msg !== null &&
-    typeof msg === "object" &&
-    typeof Reflect.get(msg, "type") === "string"
+    (type === "GET_SITE_TOGGLE" || type === "SET_SITE_TOGGLE") &&
+    typeof Reflect.get(msg, "originKey") === "string"
   );
 }
 
@@ -117,133 +90,56 @@ chrome.runtime.onStartup.addListener(() => {
   });
 });
 
-chrome.runtime.onConnect.addListener((port) => {
-  if (port.name === "content") {
-    const tabId = port.sender?.tab?.id;
-    const frameId = port.sender?.frameId ?? 0;
-    const lifecycle: unknown = port.sender
-      ? Reflect.get(port.sender, "documentLifecycle")
-      : undefined;
-    if (tabId === undefined || frameId !== 0 || lifecycle === "prerender")
-      return;
+createBackgroundPortRouter({
+  wakeBridgeOnPanelConnect: true,
+  onPanelMessage(rawMsg, { sendToPanel }) {
+    if (!isPanelToggleMessage(rawMsg)) return false;
 
-    const entry = tabs.get(tabId) ?? { url: port.sender?.tab?.url ?? null };
-    entry.content = port;
-    if (port.sender?.tab?.url) {
-      entry.url = port.sender.tab.url;
-    }
-    tabs.set(tabId, entry);
-
-    if (entry.panel && entry.url) {
-      sendToPanel(tabId, { type: "PAGE_CONNECTED", url: entry.url });
-      sendToContent(tabId, { type: "START_INSPECTION" });
+    if (rawMsg.type === "GET_SITE_TOGGLE") {
+      void readEnabledOrigins().then((origins) => {
+        sendToPanel({
+          type: "SITE_TOGGLE_STATE",
+          originKey: rawMsg.originKey,
+          enabled: origins.includes(rawMsg.originKey),
+        });
+      });
+      return true;
     }
 
-    port.onMessage.addListener((rawMsg: unknown) => {
-      if (tabs.get(tabId)?.content !== port) return;
-      if (!isIsolatedMessage(rawMsg)) return;
-      if (rawMsg.type === "BRIDGE_READY") {
-        entry.url = rawMsg.url;
-        if (entry.panel) {
-          sendToPanel(tabId, { type: "PAGE_CONNECTED", url: entry.url });
-          sendToContent(tabId, { type: "START_INSPECTION" });
-        }
-        return;
-      }
-      sendToPanel(tabId, rawMsg);
-    });
-
-    port.onDisconnect.addListener(() => {
-      const current = tabs.get(tabId);
-      if (current?.content !== port) return;
-      delete current.content;
-      if (!current.panel) {
-        tabs.delete(tabId);
-      } else {
-        sendToPanel(tabId, { type: "PAGE_DISCONNECTED" });
-      }
-    });
-    return;
-  }
-
-  if (port.name.startsWith("devtools:")) {
-    const tabId = Number(port.name.slice("devtools:".length));
-    if (!Number.isFinite(tabId)) return;
-
-    const entry = tabs.get(tabId) ?? { url: null };
-    entry.panel = port;
-    tabs.set(tabId, entry);
-
-    if (entry.content) {
-      sendToPanel(tabId, { type: "PAGE_CONNECTED", url: entry.url });
-      sendToContent(tabId, { type: "START_INSPECTION" });
-    }
-
-    port.onMessage.addListener((rawMsg: unknown) => {
-      if (tabs.get(tabId)?.panel !== port) return;
-      if (!isPanelMessage(rawMsg)) return;
-      if (rawMsg.type === "PING") {
-        sendToPanel(tabId, { type: "PONG" });
-        return;
-      }
-      if (rawMsg.type === "GET_SITE_TOGGLE") {
-        void readEnabledOrigins().then((origins) => {
-          sendToPanel(tabId, {
+    const enabled = rawMsg.enabled;
+    void enqueueToggleSync(async () => {
+      const origins = await readEnabledOrigins();
+      const nextSet = new Set(origins);
+      if (enabled) {
+        if (toMatchPattern(rawMsg.originKey) === null) {
+          sendToPanel({
             type: "SITE_TOGGLE_STATE",
             originKey: rawMsg.originKey,
-            enabled: origins.includes(rawMsg.originKey),
+            enabled: false,
           });
-        });
-        return;
+          return;
+        }
+        nextSet.add(rawMsg.originKey);
+      } else {
+        nextSet.delete(rawMsg.originKey);
       }
-      if (rawMsg.type === "SET_SITE_TOGGLE") {
-        void enqueueToggleSync(async () => {
-          const origins = await readEnabledOrigins();
-          const nextSet = new Set(origins);
-          if (rawMsg.enabled) {
-            if (toMatchPattern(rawMsg.originKey) === null) {
-              sendToPanel(tabId, {
-                type: "SITE_TOGGLE_STATE",
-                originKey: rawMsg.originKey,
-                enabled: false,
-              });
-              return;
-            }
-            nextSet.add(rawMsg.originKey);
-          } else {
-            nextSet.delete(rawMsg.originKey);
-          }
-          const nextList = Array.from(nextSet);
-          try {
-            await syncDynamicPolyfillScripts(nextList);
-            await chrome.storage.local.set({ [STORAGE_KEY]: nextList });
-            sendToPanel(tabId, {
-              type: "SITE_TOGGLE_STATE",
-              originKey: rawMsg.originKey,
-              enabled: rawMsg.enabled,
-            });
-          } catch {
-            sendToPanel(tabId, {
-              type: "SITE_TOGGLE_STATE",
-              originKey: rawMsg.originKey,
-              enabled: origins.includes(rawMsg.originKey),
-            });
-          }
+      const nextList = Array.from(nextSet);
+      try {
+        await syncDynamicPolyfillScripts(nextList);
+        await chrome.storage.local.set({ [STORAGE_KEY]: nextList });
+        sendToPanel({
+          type: "SITE_TOGGLE_STATE",
+          originKey: rawMsg.originKey,
+          enabled,
         });
-        return;
-      }
-
-      sendToContent(tabId, rawMsg);
-    });
-
-    port.onDisconnect.addListener(() => {
-      const current = tabs.get(tabId);
-      if (current?.panel !== port) return;
-      delete current.panel;
-      sendToContent(tabId, { type: "STOP_INSPECTION" });
-      if (!current.content) {
-        tabs.delete(tabId);
+      } catch {
+        sendToPanel({
+          type: "SITE_TOGGLE_STATE",
+          originKey: rawMsg.originKey,
+          enabled: origins.includes(rawMsg.originKey),
+        });
       }
     });
-  }
+    return true;
+  },
 });

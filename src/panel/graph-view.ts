@@ -1,17 +1,24 @@
+import type { SignalKind, SignalNodeSnapshot } from "../protocol/types.ts";
 import {
-  NODE_HEIGHT,
-  NODE_WIDTH,
+  GraphViewportController,
+  findNearestDirectionalNode,
+} from "../shared/graph-viewport.ts";
+import { smartTruncateToPx } from "../shared/label-format.ts";
+import {
+  type BusJunctionPoint,
+  type BusTrunkSegment,
   type GraphLayout,
   type PositionedNode,
   type RoutedEdge,
 } from "./graph-layout.ts";
 import { formatNodeDisplayName, type PanelViewModel } from "./graph-state.ts";
-import type { SignalKind, SignalNodeSnapshot } from "../protocol/types.ts";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
-const MIN_SCALE = 0.25;
-const MAX_SCALE = 2.5;
 const GRID_STEP = 20;
+const TITLE_FONT =
+  '600 12px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+const VALUE_FONT =
+  '400 11px ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace';
 
 export interface GraphViewCallbacks {
   readonly onSelectNode: (nodeId: number | null) => void;
@@ -21,6 +28,10 @@ export interface GraphViewCallbacks {
 interface NodeDomRefs {
   readonly group: SVGGElement;
   readonly kind: SignalKind;
+  readonly width: number;
+  readonly height: number;
+  readonly hasTwoLines: boolean;
+  readonly searchRing: SVGElement;
   readonly titleEl: SVGTitleElement;
   readonly nameText: SVGTextElement;
   readonly idText: SVGTextElement;
@@ -34,17 +45,6 @@ interface NodeDomRefs {
   readonly flagText: SVGTextElement;
 }
 
-interface PanSession {
-  readonly pointerId: number;
-  readonly startX: number;
-  readonly startY: number;
-  readonly originTx: number;
-  readonly originTy: number;
-  readonly clickedNodeId: number | null;
-  dragging: boolean;
-  captured: boolean;
-}
-
 function svgEl<K extends keyof SVGElementTagNameMap>(
   tag: K,
   attrs?: Readonly<Record<string, string | number>>,
@@ -56,15 +56,6 @@ function svgEl<K extends keyof SVGElementTagNameMap>(
     }
   }
   return el;
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
-}
-
-function truncateChars(text: string, maxChars: number): string {
-  if (text.length <= maxChars) return text;
-  return `${text.slice(0, Math.max(1, maxChars - 1))}…`;
 }
 
 function formatDurationShort(ms: number): string {
@@ -96,11 +87,16 @@ function createArrowMarker(id: string, className: string): SVGMarkerElement {
 function buildNodeTooltip(
   node: SignalNodeSnapshot,
   incomingCount: number,
+  subtitleLabel?: string | null,
 ): string {
+  const displayName = formatNodeDisplayName(node);
   const parts: string[] = [
-    `${formatNodeDisplayName(node)} (#${node.id} · ${node.kind})`,
+    `${displayName} (#${node.id} · ${node.kind})`,
     `Runtime: ${node.runtime} (${node.runtimeMode}) · ${node.live ? "live" : "cold"}`,
   ];
+  if (subtitleLabel && subtitleLabel !== displayName) {
+    parts.push(`Owner: ${subtitleLabel}`);
+  }
   if (node.error !== null) {
     parts.push(`Error: ${node.error}`);
   } else if (node.kind === "watcher") {
@@ -121,7 +117,10 @@ function buildNodeTooltip(
   return parts.join("\n");
 }
 
-function createNodeElement(node: SignalNodeSnapshot): NodeDomRefs {
+function createNodeElement(pos: PositionedNode): NodeDomRefs {
+  const { node, width: w, height: h } = pos;
+  const hasTwoLines = (pos.formattedTitleLines?.line2 ?? null) !== null;
+
   const group = svgEl("g", {
     class: "graph-node",
     tabindex: "0",
@@ -134,11 +133,22 @@ function createNodeElement(node: SignalNodeSnapshot): NodeDomRefs {
   const titleEl = svgEl("title");
   group.appendChild(titleEl);
 
-  const w = NODE_WIDTH;
-  const h = NODE_HEIGHT;
+  let searchRing: SVGElement;
 
   if (node.kind === "state") {
     // Rounded rectangle with crisp left accent bar
+    searchRing = svgEl("rect", {
+      class: "node-search-ring",
+      fill: "none",
+      x: -5,
+      y: -5,
+      width: w + 10,
+      height: h + 10,
+      rx: 10,
+      ry: 10,
+    });
+    searchRing.style.display = "none";
+    group.appendChild(searchRing);
     group.appendChild(
       svgEl("rect", {
         class: "node-focus-ring",
@@ -191,6 +201,13 @@ function createNodeElement(node: SignalNodeSnapshot): NodeDomRefs {
   } else if (node.kind === "computed") {
     // Chamfered precision card with beveled badge
     const bevel = 9;
+    searchRing = svgEl("path", {
+      class: "node-search-ring",
+      fill: "none",
+      d: `M ${bevel - 2} -5 L ${w - bevel + 2} -5 L ${w + 5} ${bevel - 2} L ${w + 5} ${h - bevel + 2} L ${w - bevel + 2} ${h + 5} L ${bevel - 2} ${h + 5} L -5 ${h - bevel + 2} L -5 ${bevel - 2} Z`,
+    });
+    searchRing.style.display = "none";
+    group.appendChild(searchRing);
     group.appendChild(
       svgEl("path", {
         class: "node-focus-ring",
@@ -225,6 +242,13 @@ function createNodeElement(node: SignalNodeSnapshot): NodeDomRefs {
     );
   } else {
     // Terminal / sink card with notched right terminal rail
+    searchRing = svgEl("path", {
+      class: "node-search-ring",
+      fill: "none",
+      d: `M 6 -5 L ${w - 6} -5 L ${w + 5} 8 L ${w + 5} ${h - 8} L ${w - 6} ${h + 5} L 6 ${h + 5} A 10.5 10.5 0 0 1 -5 ${h - 6} L -5 6 A 10.5 10.5 0 0 1 6 -5 Z`,
+    });
+    searchRing.style.display = "none";
+    group.appendChild(searchRing);
     group.appendChild(
       svgEl("path", {
         class: "node-focus-ring",
@@ -267,18 +291,22 @@ function createNodeElement(node: SignalNodeSnapshot): NodeDomRefs {
   const leftPad = node.kind === "state" ? 13 : 11;
   const rightEdge = node.kind === "watcher" ? w - 15 : w - 11;
   const titleX = node.kind === "state" ? 36 : 33;
+  const titleY = hasTwoLines ? 17 : 22;
+  const valueY = hasTwoLines ? 52 : 43;
+  const dividerY = hasTwoLines ? h - 21 : 51;
+  const footerY = hasTwoLines ? h - 7 : 65;
 
   const nameText = svgEl("text", {
     class: "node-title",
     x: titleX,
-    y: 22,
+    y: titleY,
   });
   group.appendChild(nameText);
 
   const idText = svgEl("text", {
     class: "node-id",
     x: rightEdge,
-    y: 22,
+    y: titleY,
     "text-anchor": "end",
   });
   group.appendChild(idText);
@@ -286,7 +314,7 @@ function createNodeElement(node: SignalNodeSnapshot): NodeDomRefs {
   const valueText = svgEl("text", {
     class: "node-value",
     x: leftPad,
-    y: 43,
+    y: valueY,
   });
   group.appendChild(valueText);
 
@@ -294,16 +322,16 @@ function createNodeElement(node: SignalNodeSnapshot): NodeDomRefs {
     svgEl("line", {
       class: "node-divider",
       x1: leftPad,
-      y1: 51,
+      y1: dividerY,
       x2: rightEdge,
-      y2: 51,
+      y2: dividerY,
     }),
   );
 
   const liveDot = svgEl("circle", {
     class: "node-live-dot",
     cx: leftPad + 3.5,
-    cy: 61.5,
+    cy: footerY - 3.5,
     r: 3,
   });
   group.appendChild(liveDot);
@@ -311,7 +339,7 @@ function createNodeElement(node: SignalNodeSnapshot): NodeDomRefs {
   const liveLabel = svgEl("text", {
     class: "node-meta",
     x: leftPad + 11,
-    y: 65,
+    y: footerY,
   });
   group.appendChild(liveLabel);
 
@@ -320,7 +348,7 @@ function createNodeElement(node: SignalNodeSnapshot): NodeDomRefs {
     inlineCauseText = svgEl("text", {
       class: "node-cause-inline",
       x: leftPad + 44,
-      y: 65,
+      y: footerY,
     });
     group.appendChild(inlineCauseText);
   }
@@ -328,7 +356,7 @@ function createNodeElement(node: SignalNodeSnapshot): NodeDomRefs {
   const rightMetaText = svgEl("text", {
     class: "node-meta-num",
     x: rightEdge,
-    y: 65,
+    y: footerY,
     "text-anchor": "end",
   });
   group.appendChild(rightMetaText);
@@ -336,7 +364,7 @@ function createNodeElement(node: SignalNodeSnapshot): NodeDomRefs {
   // Top-right status pill (CAUSE or ERR)
   const flagGroup = svgEl("g", {
     class: "node-flag",
-    transform: `translate(${w - 48}, -9)`,
+    transform: `translate(${rightEdge - 37}, -8)`,
   });
   flagGroup.style.display = "none";
   const flagRect = svgEl("rect", {
@@ -360,6 +388,10 @@ function createNodeElement(node: SignalNodeSnapshot): NodeDomRefs {
   return {
     group,
     kind: node.kind,
+    width: w,
+    height: h,
+    hasTwoLines,
+    searchRing,
     titleEl,
     nameText,
     idText,
@@ -381,17 +413,21 @@ export class GraphView {
   readonly #gridPattern: SVGPatternElement;
   readonly #viewportGroup: SVGGElement;
   readonly #edgesGroup: SVGGElement;
+  readonly #busLayer: SVGGElement;
   readonly #nodesGroup: SVGGElement;
+  readonly #viewport: GraphViewportController;
   readonly #nodeRefs = new Map<number, NodeDomRefs>();
   readonly #resizeObserver: ResizeObserver;
+  readonly #unbindPan: () => void;
+  readonly #unbindWheel: () => void;
 
-  #tx = 0;
-  #ty = 0;
-  #scale = 1;
   #hasAutoFitted = false;
   #pendingAutoFit = false;
+  #busRenderKey = "";
+  #lastVm: PanelViewModel | null = null;
   #lastLayout: GraphLayout | null = null;
-  #panSession: PanSession | null = null;
+  #lastFocusNodeId: number | null = null;
+  #lastNodeCount = 0;
 
   constructor(
     stageEl: HTMLElement,
@@ -406,6 +442,7 @@ export class GraphView {
       "data-testid": "graph-svg",
       role: "region",
       "aria-label": "Signal reactivity graph",
+      tabindex: "0",
     });
 
     const defs = svgEl("defs");
@@ -447,6 +484,8 @@ export class GraphView {
 
     this.#viewportGroup = svgEl("g", { class: "graph-viewport" });
     this.#edgesGroup = svgEl("g", { class: "graph-edges" });
+    this.#busLayer = svgEl("g", { class: "graph-bus-layer" });
+    this.#edgesGroup.appendChild(this.#busLayer);
     this.#nodesGroup = svgEl("g", { class: "graph-nodes" });
     this.#viewportGroup.appendChild(this.#edgesGroup);
     this.#viewportGroup.appendChild(this.#nodesGroup);
@@ -454,23 +493,34 @@ export class GraphView {
 
     mountEl.replaceChildren(this.#svg);
 
-    this.#svg.addEventListener("pointerdown", this.#onPointerDown);
-    this.#svg.addEventListener("pointermove", this.#onPointerMove);
-    this.#svg.addEventListener("pointerup", this.#onPointerUp);
-    this.#svg.addEventListener("pointercancel", this.#onPointerCancel);
-    this.#svg.addEventListener("wheel", this.#onWheel, { passive: false });
+    this.#viewport = new GraphViewportController({
+      onChange: () => {
+        this.#applyTransform();
+      },
+    });
+
+    this.#unbindPan = this.#viewport.bindPointerPan(this.#svg, {
+      shouldIgnoreTarget: (target) =>
+        target instanceof Element && target.closest(".graph-node") !== null,
+    });
+    this.#unbindWheel = this.#viewport.bindWheelZoom(this.#svg, {
+      getViewportOrigin: () => this.#stageEl.getBoundingClientRect(),
+    });
+
+    this.#svg.addEventListener("click", this.#onClick);
     this.#svg.addEventListener("dblclick", this.#onDoubleClick);
     this.#svg.addEventListener("keydown", this.#onKeyDown);
 
     this.#resizeObserver = new ResizeObserver(() => {
       if (
-        this.#pendingAutoFit &&
+        (this.#pendingAutoFit || !this.#viewport.userTransformed) &&
         this.#lastLayout &&
         this.#lastLayout.nodes.length > 0
       ) {
-        if (this.#stageEl.clientWidth > 0 && this.#stageEl.clientHeight > 0) {
-          this.#pendingAutoFit = false;
-          this.#hasAutoFitted = true;
+        if (
+          this.#stageEl.clientWidth >= 20 &&
+          this.#stageEl.clientHeight >= 20
+        ) {
           this.fitToViewport();
         }
       }
@@ -479,9 +529,24 @@ export class GraphView {
     this.#applyTransform();
   }
 
-  render(vm: PanelViewModel): void {
+  render(vm: PanelViewModel, activeSearchMatchId: number | null = null): void {
+    const prevFocusId = this.#lastFocusNodeId;
+    const prevNodeCount = this.#lastNodeCount;
+
+    const activeElement = document.activeElement;
+    const focusedNodeAttr =
+      activeElement instanceof SVGElement &&
+      this.#nodesGroup.contains(activeElement)
+        ? activeElement.getAttribute("data-node-id")
+        : null;
+    const keyboardFocusNodeId =
+      focusedNodeAttr !== null ? Number(focusedNodeAttr) : null;
+
     const layout = vm.layout;
+    this.#lastVm = vm;
     this.#lastLayout = layout;
+    this.#lastFocusNodeId = vm.focusedNode?.id ?? null;
+    this.#lastNodeCount = layout.nodes.length;
 
     const incomingCountById = new Map<number, number>();
     if (vm.snapshot) {
@@ -493,74 +558,121 @@ export class GraphView {
       }
     }
 
-    this.#renderEdges(layout.edges, vm);
-    this.#renderNodes(layout.nodes, vm, incomingCountById);
+    this.#renderEdges(layout, vm);
+    this.#renderNodes(layout.nodes, vm, incomingCountById, activeSearchMatchId);
 
-    if (layout.nodes.length > 0 && !this.#hasAutoFitted) {
-      if (this.#stageEl.clientWidth > 0 && this.#stageEl.clientHeight > 0) {
-        this.#hasAutoFitted = true;
-        this.#pendingAutoFit = false;
+    if (keyboardFocusNodeId !== null && Number.isFinite(keyboardFocusNodeId)) {
+      const target = this.#nodeRefs.get(keyboardFocusNodeId)?.group;
+      if (target) {
+        if (document.activeElement !== target) {
+          target.focus({ preventScroll: true });
+        }
+      } else {
+        this.#svg.focus({ preventScroll: true });
+      }
+    }
+
+    const focusChanged = prevFocusId !== this.#lastFocusNodeId;
+    const becamePopulated = prevNodeCount === 0 && layout.nodes.length > 0;
+    if (
+      layout.nodes.length > 0 &&
+      (!this.#hasAutoFitted || becamePopulated || focusChanged)
+    ) {
+      if (!this.#viewport.userTransformed || focusChanged || becamePopulated) {
         this.fitToViewport();
       } else {
-        this.#pendingAutoFit = true;
+        this.#applyTransform();
       }
+    } else {
+      this.#applyTransform();
     }
   }
 
   fitToViewport(): void {
     const layout = this.#lastLayout;
     if (!layout || layout.nodes.length === 0) {
-      this.#tx = 0;
-      this.#ty = 0;
-      this.#scale = 1;
-      this.#applyTransform();
+      this.#pendingAutoFit = false;
+      this.#viewport.resetZoom();
       return;
     }
 
     const stageW = this.#stageEl.clientWidth;
     const stageH = this.#stageEl.clientHeight;
-    if (stageW <= 0 || stageH <= 0) {
+    if (stageW < 20 || stageH < 20) {
       this.#pendingAutoFit = true;
       return;
     }
 
-    const padX = 28;
-    const padTop = 24;
-    const padBottom = 46;
-    const availW = Math.max(80, stageW - padX * 2);
-    const availH = Math.max(80, stageH - padTop - padBottom);
+    const pad = 24;
+    const availW = Math.max(1, stageW - pad * 2);
+    const availH = Math.max(1, stageH - pad * 2);
+    const isCompactGraph =
+      Boolean(this.#lastVm?.focusedNode) || layout.nodes.length <= 40;
+    const minScaleFloor = isCompactGraph
+      ? Math.max(
+          0.25,
+          Math.min(0.56, availW / layout.width, availH / layout.height),
+        )
+      : 0.56;
 
-    const nextScale = clamp(
-      Math.min(availW / layout.width, availH / layout.height),
-      MIN_SCALE,
-      1.15,
+    let anchor = this.#lastVm?.selectedNode
+      ? layout.nodeById.get(this.#lastVm.selectedNode.id)
+      : undefined;
+    if (!anchor) {
+      let bestScore = -1;
+      for (const candidate of layout.nodes) {
+        const score =
+          candidate.node.sets + candidate.node.runs + candidate.node.notifies;
+        if (!anchor || score > bestScore) {
+          bestScore = score;
+          anchor = candidate;
+        }
+      }
+    }
+
+    const fitted = this.#viewport.fitToRect(
+      { x: 0, y: 0, width: layout.width, height: layout.height },
+      { width: stageW, height: stageH },
+      {
+        padding: pad,
+        minScale: minScaleFloor,
+        maxScale: 1.15,
+        ...(anchor
+          ? {
+              anchorRect: {
+                x: anchor.x,
+                y: anchor.y,
+                width: anchor.width,
+                height: anchor.height,
+              },
+              anchorBiasX: 0.36,
+              anchorBiasY: 0.5,
+            }
+          : {}),
+        markUserTransformed: false,
+      },
     );
-    const contentW = layout.width * nextScale;
-    const contentH = layout.height * nextScale;
 
-    this.#scale = nextScale;
-    this.#tx = Math.round((stageW - contentW) / 2);
-    this.#ty = Math.round(padTop + (availH - contentH) / 2);
-    this.#applyTransform();
+    if (fitted) {
+      this.#hasAutoFitted = true;
+      this.#pendingAutoFit = false;
+    } else {
+      this.#pendingAutoFit = true;
+    }
   }
 
   zoomBy(factor: number): void {
-    const stageW = this.#stageEl.clientWidth;
-    const stageH = this.#stageEl.clientHeight;
-    this.#zoomAtPoint(stageW / 2, stageH / 2, factor);
+    this.#viewport.zoomAtCenter(
+      {
+        width: this.#stageEl.clientWidth,
+        height: this.#stageEl.clientHeight,
+      },
+      factor,
+    );
   }
 
   resetZoom(): void {
-    const stageW = this.#stageEl.clientWidth;
-    const stageH = this.#stageEl.clientHeight;
-    const cx = stageW / 2;
-    const cy = stageH / 2;
-    const wx = (cx - this.#tx) / this.#scale;
-    const wy = (cy - this.#ty) / this.#scale;
-    this.#scale = 1;
-    this.#tx = Math.round(cx - wx);
-    this.#ty = Math.round(cy - wy);
-    this.#applyTransform();
+    this.#viewport.resetZoom();
   }
 
   panToNode(nodeId: number): void {
@@ -568,12 +680,15 @@ export class GraphView {
     if (!pos) return;
     const stageW = this.#stageEl.clientWidth;
     const stageH = this.#stageEl.clientHeight;
-    if (stageW <= 0 || stageH <= 0) return;
+    if (stageW < 20 || stageH < 20) return;
 
-    const screenLeft = pos.x * this.#scale + this.#tx;
-    const screenTop = pos.y * this.#scale + this.#ty;
-    const screenRight = (pos.x + pos.width) * this.#scale + this.#tx;
-    const screenBottom = (pos.y + pos.height) * this.#scale + this.#ty;
+    const scale = this.#viewport.scale;
+    const tx = this.#viewport.tx;
+    const ty = this.#viewport.ty;
+    const screenLeft = pos.x * scale + tx;
+    const screenTop = pos.y * scale + ty;
+    const screenRight = (pos.x + pos.width) * scale + tx;
+    const screenBottom = (pos.y + pos.height) * scale + ty;
 
     const margin = 36;
     if (
@@ -585,43 +700,71 @@ export class GraphView {
       return;
     }
 
-    const nodeCenterX = pos.x + pos.width / 2;
-    const nodeCenterY = pos.y + pos.height / 2;
-    this.#tx = Math.round(stageW / 2 - nodeCenterX * this.#scale);
-    this.#ty = Math.round(stageH / 2 - nodeCenterY * this.#scale);
-    this.#applyTransform();
+    this.#viewport.centerOnRect(
+      { x: pos.x, y: pos.y, width: pos.width, height: pos.height },
+      { width: stageW, height: stageH },
+      { markUserTransformed: true },
+    );
   }
 
   dispose(): void {
     this.#resizeObserver.disconnect();
-    this.#svg.removeEventListener("pointerdown", this.#onPointerDown);
-    this.#svg.removeEventListener("pointermove", this.#onPointerMove);
-    this.#svg.removeEventListener("pointerup", this.#onPointerUp);
-    this.#svg.removeEventListener("pointercancel", this.#onPointerCancel);
-    this.#svg.removeEventListener("wheel", this.#onWheel);
+    this.#unbindPan();
+    this.#unbindWheel();
+    this.#svg.removeEventListener("click", this.#onClick);
     this.#svg.removeEventListener("dblclick", this.#onDoubleClick);
     this.#svg.removeEventListener("keydown", this.#onKeyDown);
   }
 
-  #renderEdges(edges: ReadonlyArray<RoutedEdge>, vm: PanelViewModel): void {
-    const selectedId = vm.selectedNode?.id ?? null;
+  #renderEdges(layout: GraphLayout, vm: PanelViewModel): void {
+    const selectedId =
+      vm.selectedNode && vm.visibleNodeIds.has(vm.selectedNode.id)
+        ? vm.selectedNode.id
+        : null;
 
     interface ClassifiedEdge {
       readonly edge: RoutedEdge;
+      readonly edgeKey: string;
       readonly priority: number;
       readonly relation: "upstream" | "downstream" | null;
       readonly causal: boolean;
+      readonly highlighted: boolean;
       readonly dimmed: boolean;
       readonly markerId: string;
     }
 
-    const classified: ClassifiedEdge[] = edges.map((edge) => {
+    const highlightedEdgeIds = new Set<string>();
+    const dimmedEdgeIds = new Set<string>();
+    const edgeRelationById = new Map<string, "upstream" | "downstream">();
+
+    const classified: ClassifiedEdge[] = layout.edges.map((edge) => {
+      const edgeKey = edge.id ?? `${edge.sourceId}->${edge.sinkId}`;
+
       if (selectedId === null) {
+        const isDimmed =
+          vm.isHighlightQueryActive &&
+          !vm.searchMatchIds.has(edge.sourceId) &&
+          !vm.searchMatchIds.has(edge.sinkId);
+        if (isDimmed) {
+          dimmedEdgeIds.add(edgeKey);
+          return {
+            edge,
+            edgeKey,
+            priority: 0,
+            relation: null,
+            causal: false,
+            highlighted: false,
+            dimmed: true,
+            markerId: "arrow-dim",
+          };
+        }
         return {
           edge,
+          edgeKey,
           priority: 1,
           relation: null,
           causal: false,
+          highlighted: false,
           dimmed: false,
           markerId: "arrow-default",
         };
@@ -630,11 +773,15 @@ export class GraphView {
       const isCausal =
         edge.sinkId === selectedId && vm.directCauseIds.has(edge.sourceId);
       if (isCausal) {
+        highlightedEdgeIds.add(edgeKey);
+        edgeRelationById.set(edgeKey, "upstream");
         return {
           edge,
+          edgeKey,
           priority: 3,
           relation: "upstream",
           causal: true,
+          highlighted: true,
           dimmed: false,
           markerId: "arrow-cause",
         };
@@ -644,11 +791,15 @@ export class GraphView {
         (edge.sinkId === selectedId || vm.upstreamIds.has(edge.sinkId)) &&
         vm.upstreamIds.has(edge.sourceId);
       if (isUpstream) {
+        highlightedEdgeIds.add(edgeKey);
+        edgeRelationById.set(edgeKey, "upstream");
         return {
           edge,
+          edgeKey,
           priority: 2,
           relation: "upstream",
           causal: false,
+          highlighted: true,
           dimmed: false,
           markerId: "arrow-upstream",
         };
@@ -658,33 +809,64 @@ export class GraphView {
         (edge.sourceId === selectedId || vm.downstreamIds.has(edge.sourceId)) &&
         vm.downstreamIds.has(edge.sinkId);
       if (isDownstream) {
+        highlightedEdgeIds.add(edgeKey);
+        edgeRelationById.set(edgeKey, "downstream");
         return {
           edge,
+          edgeKey,
           priority: 2,
           relation: "downstream",
           causal: false,
+          highlighted: true,
           dimmed: false,
           markerId: "arrow-downstream",
         };
       }
 
+      dimmedEdgeIds.add(edgeKey);
       return {
         edge,
+        edgeKey,
         priority: 0,
         relation: null,
         causal: false,
+        highlighted: false,
         dimmed: true,
         markerId: "arrow-dim",
       };
     });
 
+    const busTrunks = layout.busTrunks ?? [];
+    const junctions = layout.junctions ?? [];
+    const trunkByEdgeId = new Map<string, BusTrunkSegment>();
+    for (const trunk of busTrunks) {
+      for (const edgeId of trunk.memberEdgeIds) {
+        trunkByEdgeId.set(edgeId, trunk);
+      }
+    }
+
+    this.#renderBusLayer(
+      busTrunks,
+      junctions,
+      highlightedEdgeIds,
+      dimmedEdgeIds,
+      edgeRelationById,
+    );
+
     classified.sort((a, b) => a.priority - b.priority);
 
     const frag = document.createDocumentFragment();
     for (const item of classified) {
+      const effectivePath = this.#resolveEdgePath(
+        layout,
+        item.edge,
+        item.edgeKey,
+        item.highlighted,
+        trunkByEdgeId,
+      );
       const pathEl = svgEl("path", {
         class: "graph-edge",
-        d: item.edge.path,
+        d: effectivePath,
         "marker-end": `url(#${item.markerId})`,
         "data-source-id": item.edge.sourceId,
         "data-sink-id": item.edge.sinkId,
@@ -698,32 +880,237 @@ export class GraphView {
       if (item.dimmed) {
         pathEl.setAttribute("data-dimmed", "true");
       }
+      if (item.edge.isFeedback) {
+        pathEl.setAttribute("data-feedback", "true");
+      }
       frag.appendChild(pathEl);
     }
 
-    this.#edgesGroup.replaceChildren(frag);
+    this.#edgesGroup.replaceChildren(this.#busLayer, frag);
+  }
+
+  #resolveEdgePath(
+    layout: GraphLayout,
+    edge: RoutedEdge,
+    edgeKey: string,
+    isHighlighted: boolean,
+    trunkByEdgeId: ReadonlyMap<string, BusTrunkSegment>,
+  ): string {
+    if (!edge.isBusMember || isHighlighted || !edge.points) {
+      return edge.path;
+    }
+    const trunk = trunkByEdgeId.get(edgeKey);
+    if (!trunk) return edge.path;
+
+    const srcPos = layout.nodeById.get(edge.sourceId);
+    const dstPos = layout.nodeById.get(edge.sinkId);
+    if (
+      !srcPos ||
+      !dstPos ||
+      srcPos.isIsolated ||
+      dstPos.isIsolated ||
+      srcPos.layer !== trunk.layerIndex ||
+      dstPos.layer !== trunk.layerIndex + 1
+    ) {
+      return edge.path;
+    }
+
+    const pts = edge.points;
+    const penultimate = pts.length >= 2 ? pts[pts.length - 2] : undefined;
+    const yTap =
+      penultimate && Math.abs(penultimate.x - trunk.x) < 1
+        ? penultimate.y
+        : edge.y2;
+    return `M ${trunk.x} ${yTap} L ${edge.x2} ${edge.y2}`;
+  }
+
+  #renderBusLayer(
+    busTrunks: ReadonlyArray<BusTrunkSegment>,
+    junctions: ReadonlyArray<BusJunctionPoint>,
+    highlightedEdgeIds: ReadonlySet<string>,
+    dimmedEdgeIds: ReadonlySet<string>,
+    edgeRelationById: ReadonlyMap<string, "upstream" | "downstream">,
+  ): void {
+    const trunkStates = busTrunks.map((trunk) => {
+      let anyHighlighted = false;
+      let anyDimmed = false;
+      let anyPlainVisible = false;
+      let sharedRelation: "upstream" | "downstream" | null = null;
+      let mixedRelation = false;
+      for (const edgeId of trunk.memberEdgeIds) {
+        const hl = highlightedEdgeIds.has(edgeId);
+        const dm = dimmedEdgeIds.has(edgeId);
+        if (hl) {
+          anyHighlighted = true;
+          const rel = edgeRelationById.get(edgeId) ?? null;
+          if (!rel) {
+            mixedRelation = true;
+          } else if (sharedRelation === null) {
+            sharedRelation = rel;
+          } else if (sharedRelation !== rel) {
+            mixedRelation = true;
+          }
+        }
+        if (dm) anyDimmed = true;
+        if (!hl && !dm) anyPlainVisible = true;
+      }
+      const isHighlighted = anyHighlighted && !anyDimmed;
+      const isDimmed =
+        trunk.memberEdgeIds.length > 0 &&
+        !isHighlighted &&
+        ((anyDimmed && !anyPlainVisible) ||
+          trunk.memberEdgeIds.every((id) => dimmedEdgeIds.has(id)));
+      const relation = isHighlighted && !mixedRelation ? sharedRelation : null;
+      return { trunk, isHighlighted, isDimmed, relation };
+    });
+
+    const junctionStateByKey = new Map<
+      string,
+      {
+        hasHighlighted: boolean;
+        hasVisible: boolean;
+        relation: "upstream" | "downstream" | null;
+        mixedRelation: boolean;
+      }
+    >();
+    for (const st of trunkStates) {
+      const existing = junctionStateByKey.get(st.trunk.busGroupKey) ?? {
+        hasHighlighted: false,
+        hasVisible: false,
+        relation: null,
+        mixedRelation: false,
+      };
+      if (st.isHighlighted) {
+        existing.hasHighlighted = true;
+        if (!st.relation) {
+          existing.mixedRelation = true;
+        } else if (existing.relation === null) {
+          existing.relation = st.relation;
+        } else if (existing.relation !== st.relation) {
+          existing.mixedRelation = true;
+        }
+      }
+      if (!st.isDimmed) existing.hasVisible = true;
+      junctionStateByKey.set(st.trunk.busGroupKey, existing);
+    }
+
+    const keyParts: string[] = [];
+    for (const st of trunkStates) {
+      keyParts.push(
+        `T:${st.trunk.busGroupKey}:${st.trunk.kind}:${st.trunk.path}:${st.isHighlighted ? 1 : 0}:${st.isDimmed ? 1 : 0}:${st.relation ?? ""}`,
+      );
+    }
+    for (const j of junctions) {
+      const jState = j.busGroupKey
+        ? junctionStateByKey.get(j.busGroupKey)
+        : undefined;
+      const isHl = jState?.hasHighlighted ?? false;
+      const isDm = jState ? !jState.hasVisible : false;
+      const jRel =
+        jState && isHl && !jState.mixedRelation ? jState.relation : null;
+      keyParts.push(
+        `J:${j.x}:${j.y}:${j.kind}:${isHl ? 1 : 0}:${isDm ? 1 : 0}:${jRel ?? ""}`,
+      );
+    }
+    const nextKey = keyParts.join("\u0001");
+    if (nextKey === this.#busRenderKey) return;
+    this.#busRenderKey = nextKey;
+
+    if (busTrunks.length === 0 && junctions.length === 0) {
+      this.#busLayer.replaceChildren();
+      return;
+    }
+
+    const children: SVGElement[] = [];
+    for (const st of trunkStates) {
+      const classes = ["graph-bus-trunk"];
+      if (st.isHighlighted) classes.push("is-highlighted");
+      if (st.isDimmed) classes.push("is-dimmed");
+      const trunkEl = svgEl("path", {
+        class: classes.join(" "),
+        fill: "none",
+        d: st.trunk.path,
+        "data-kind": st.trunk.kind,
+      });
+      if (st.isHighlighted) {
+        trunkEl.setAttribute("data-highlighted", "true");
+      }
+      if (st.relation) {
+        trunkEl.setAttribute("data-relation", st.relation);
+      }
+      if (st.isDimmed) {
+        trunkEl.setAttribute("data-dimmed", "true");
+      }
+      children.push(trunkEl);
+    }
+
+    for (const j of junctions) {
+      const jState = j.busGroupKey
+        ? junctionStateByKey.get(j.busGroupKey)
+        : undefined;
+      const isHl = jState?.hasHighlighted ?? false;
+      const isDm = jState ? !jState.hasVisible : false;
+      const jRel =
+        jState && isHl && !jState.mixedRelation ? jState.relation : null;
+      const classes = ["graph-bus-junction"];
+      if (isHl) classes.push("is-highlighted");
+      if (isDm) classes.push("is-dimmed");
+      const junctionEl = svgEl("circle", {
+        class: classes.join(" "),
+        stroke: "none",
+        cx: j.x,
+        cy: j.y,
+        r: 2.8,
+        "data-kind": j.kind,
+      });
+      if (isHl) {
+        junctionEl.setAttribute("data-highlighted", "true");
+      }
+      if (jRel) {
+        junctionEl.setAttribute("data-relation", jRel);
+      }
+      if (isDm) {
+        junctionEl.setAttribute("data-dimmed", "true");
+      }
+      children.push(junctionEl);
+    }
+
+    this.#busLayer.replaceChildren(...children);
   }
 
   #renderNodes(
     positioned: ReadonlyArray<PositionedNode>,
     vm: PanelViewModel,
     incomingCountById: ReadonlyMap<number, number>,
+    activeSearchMatchId: number | null,
   ): void {
-    const selectedId = vm.selectedNode?.id ?? null;
+    const selectedId =
+      vm.selectedNode && vm.visibleNodeIds.has(vm.selectedNode.id)
+        ? vm.selectedNode.id
+        : null;
     const activeIds = new Set<number>();
 
     for (const pos of positioned) {
       const node = pos.node;
       activeIds.add(node.id);
+      const hasTwoLines = (pos.formattedTitleLines?.line2 ?? null) !== null;
 
       let refs = this.#nodeRefs.get(node.id);
-      if (!refs || refs.kind !== node.kind) {
+      if (
+        !refs ||
+        refs.kind !== node.kind ||
+        refs.width !== pos.width ||
+        refs.height !== pos.height ||
+        refs.hasTwoLines !== hasTwoLines
+      ) {
+        const nextRefs = createNodeElement(pos);
         if (refs) {
-          refs.group.remove();
+          refs.group.replaceWith(nextRefs.group);
+        } else {
+          this.#nodesGroup.appendChild(nextRefs.group);
         }
-        refs = createNodeElement(node);
+        refs = nextRefs;
         this.#nodeRefs.set(node.id, refs);
-        this.#nodesGroup.appendChild(refs.group);
       }
 
       refs.group.setAttribute("transform", `translate(${pos.x}, ${pos.y})`);
@@ -732,12 +1119,20 @@ export class GraphView {
       const isCause = selectedId !== null && vm.directCauseIds.has(node.id);
       const isUpstream = selectedId !== null && vm.upstreamIds.has(node.id);
       const isDownstream = selectedId !== null && vm.downstreamIds.has(node.id);
+      const isSearchMatch =
+        vm.isHighlightQueryActive && vm.searchMatchIds.has(node.id);
+      const isActiveMatch =
+        activeSearchMatchId !== null &&
+        activeSearchMatchId === node.id &&
+        vm.searchMatchIds.has(node.id);
       const isDimmed =
-        selectedId !== null &&
-        !isSelected &&
-        !isUpstream &&
-        !isDownstream &&
-        !isCause;
+        selectedId !== null
+          ? !isSelected &&
+            !isUpstream &&
+            !isDownstream &&
+            !isCause &&
+            !isSearchMatch
+          : vm.isHighlightQueryActive && !isSearchMatch;
 
       refs.group.setAttribute("aria-pressed", String(isSelected));
       refs.group.setAttribute("data-selected", String(isSelected));
@@ -753,12 +1148,31 @@ export class GraphView {
         refs.group.removeAttribute("data-relation");
       }
 
+      if (isSearchMatch) {
+        refs.group.setAttribute("data-search-match", "true");
+      } else {
+        refs.group.removeAttribute("data-search-match");
+      }
+
+      if (isActiveMatch) {
+        refs.group.setAttribute("data-active-match", "true");
+      } else {
+        refs.group.removeAttribute("data-active-match");
+      }
+
+      refs.searchRing.style.display =
+        isSearchMatch || isActiveMatch ? "" : "none";
+
       if (isDimmed) {
         refs.group.setAttribute("data-dimmed", "true");
       } else {
         refs.group.removeAttribute("data-dimmed");
       }
 
+      const w = pos.width;
+      const leftPad = node.kind === "state" ? 13 : 11;
+      const rightEdge = node.kind === "watcher" ? w - 15 : w - 11;
+      const titleX = node.kind === "state" ? 36 : 33;
       const displayName = formatNodeDisplayName(node);
       const incomingCount = incomingCountById.get(node.id) ?? 0;
 
@@ -766,17 +1180,43 @@ export class GraphView {
         "aria-label",
         `${displayName}, ${node.kind} signal #${node.id}, ${node.live ? "live" : "cold"}${node.error ? `, error: ${node.error}` : ""}`,
       );
-      refs.titleEl.textContent = buildNodeTooltip(node, incomingCount);
+      refs.titleEl.textContent = buildNodeTooltip(
+        node,
+        incomingCount,
+        pos.subtitleLabel,
+      );
 
       const idLabel = `#${node.id}`;
-      const maxTitleChars = Math.max(10, 21 - idLabel.length);
-      refs.nameText.textContent = truncateChars(displayName, maxTitleChars);
       refs.idText.textContent = idLabel;
 
+      const titleLines = pos.formattedTitleLines;
+      if (titleLines && titleLines.line2 !== null) {
+        const tspan1 = svgEl("tspan", { x: titleX, y: 17 });
+        tspan1.textContent = titleLines.line1;
+        const tspan2 = svgEl("tspan", { x: titleX, dy: 13 });
+        tspan2.textContent = titleLines.line2;
+        refs.nameText.replaceChildren(tspan1, tspan2);
+      } else {
+        const singleTitle =
+          pos.formattedTitle ??
+          titleLines?.line1 ??
+          smartTruncateToPx(
+            displayName,
+            Math.max(40, rightEdge - titleX - 36),
+            TITLE_FONT,
+          );
+        refs.nameText.textContent = singleTitle;
+      }
+
       // Value / status line
+      const availValuePx = Math.max(80, rightEdge - leftPad);
       refs.valueText.setAttribute("class", "node-value");
       if (node.error !== null) {
-        refs.valueText.textContent = truncateChars(`! ${node.error}`, 26);
+        refs.valueText.textContent = smartTruncateToPx(
+          `! ${node.error}`,
+          availValuePx,
+          VALUE_FONT,
+        );
         refs.valueText.classList.add("is-error");
       } else if (node.kind === "watcher") {
         refs.valueText.textContent =
@@ -787,7 +1227,11 @@ export class GraphView {
         refs.valueText.textContent = "(unread)";
         refs.valueText.classList.add("is-unread");
       } else if (node.value) {
-        refs.valueText.textContent = truncateChars(node.value.text, 27);
+        refs.valueText.textContent = smartTruncateToPx(
+          node.value.text,
+          availValuePx,
+          VALUE_FONT,
+        );
         if (
           node.value.kind === "number" ||
           node.value.kind === "string" ||
@@ -834,7 +1278,7 @@ export class GraphView {
         refs.flagRect.setAttribute("width", "34");
         refs.flagGroup.setAttribute(
           "transform",
-          `translate(${NODE_WIDTH - 42}, -8)`,
+          `translate(${rightEdge - 34}, -8)`,
         );
         refs.flagText.setAttribute("x", "17");
         refs.flagText.textContent = "ERR";
@@ -844,7 +1288,7 @@ export class GraphView {
         refs.flagRect.setAttribute("width", "44");
         refs.flagGroup.setAttribute(
           "transform",
-          `translate(${NODE_WIDTH - 52}, -8)`,
+          `translate(${rightEdge - 44}, -8)`,
         );
         refs.flagText.setAttribute("x", "22");
         refs.flagText.textContent = "CAUSE";
@@ -862,26 +1306,22 @@ export class GraphView {
   }
 
   #applyTransform(): void {
+    const scale = this.#viewport.scale;
+    const tx = this.#viewport.tx;
+    const ty = this.#viewport.ty;
     this.#viewportGroup.setAttribute(
       "transform",
-      `translate(${this.#tx}, ${this.#ty}) scale(${this.#scale})`,
+      this.#viewport.getSvgTransformAttribute(),
     );
     this.#gridPattern.setAttribute(
       "patternTransform",
-      `translate(${this.#tx} ${this.#ty}) scale(${this.#scale})`,
+      `translate(${tx.toFixed(1)} ${ty.toFixed(1)}) scale(${scale.toFixed(4)})`,
     );
-    this.#callbacks.onZoomChange(this.#scale);
-  }
-
-  #zoomAtPoint(px: number, py: number, factor: number): void {
-    const nextScale = clamp(this.#scale * factor, MIN_SCALE, MAX_SCALE);
-    if (nextScale === this.#scale) return;
-    const wx = (px - this.#tx) / this.#scale;
-    const wy = (py - this.#ty) / this.#scale;
-    this.#scale = nextScale;
-    this.#tx = px - wx * nextScale;
-    this.#ty = py - wy * nextScale;
-    this.#applyTransform();
+    const isZoomedOut =
+      (scale < 0.45 && (this.#lastLayout?.edges.length ?? 0) > 40) ||
+      scale < 0.34;
+    this.#svg.classList.toggle("is-zoomed-out", isZoomedOut);
+    this.#callbacks.onZoomChange(scale);
   }
 
   #findNodeIdFromTarget(target: EventTarget | null): number | null {
@@ -894,86 +1334,18 @@ export class GraphView {
     return Number.isFinite(parsed) ? parsed : null;
   }
 
-  readonly #onPointerDown = (event: PointerEvent): void => {
-    if (event.button !== 0) return;
+  readonly #onClick = (event: MouseEvent): void => {
     const clickedNodeId = this.#findNodeIdFromTarget(event.target);
-    this.#panSession = {
-      pointerId: event.pointerId,
-      startX: event.clientX,
-      startY: event.clientY,
-      originTx: this.#tx,
-      originTy: this.#ty,
-      clickedNodeId,
-      dragging: false,
-      captured: false,
-    };
-  };
-
-  readonly #onPointerMove = (event: PointerEvent): void => {
-    const session = this.#panSession;
-    if (!session || session.pointerId !== event.pointerId) return;
-
-    const dx = event.clientX - session.startX;
-    const dy = event.clientY - session.startY;
-    if (!session.dragging && Math.hypot(dx, dy) > 4) {
-      session.dragging = true;
-      this.#svg.classList.add("is-panning");
-      try {
-        this.#svg.setPointerCapture(session.pointerId);
-        session.captured = true;
-      } catch {
-        // Ignore if pointer capture is unavailable in synthetic test events
-      }
+    const didPanMove = this.#viewport.consumeDidPanMove();
+    if (clickedNodeId !== null) {
+      this.#callbacks.onSelectNode(clickedNodeId);
+      this.#nodeRefs.get(clickedNodeId)?.group.focus({ preventScroll: true });
+      return;
     }
-
-    if (session.dragging) {
-      this.#tx = session.originTx + dx;
-      this.#ty = session.originTy + dy;
-      this.#applyTransform();
+    if (didPanMove) {
+      return;
     }
-  };
-
-  readonly #onPointerUp = (event: PointerEvent): void => {
-    const session = this.#panSession;
-    if (!session || session.pointerId !== event.pointerId) return;
-    this.#panSession = null;
-    this.#svg.classList.remove("is-panning");
-
-    if (session.captured) {
-      try {
-        this.#svg.releasePointerCapture(session.pointerId);
-      } catch {
-        // Ignore release errors
-      }
-    }
-
-    if (!session.dragging) {
-      if (session.clickedNodeId !== null) {
-        this.#callbacks.onSelectNode(session.clickedNodeId);
-        this.#nodeRefs
-          .get(session.clickedNodeId)
-          ?.group.focus({ preventScroll: true });
-      } else {
-        this.#callbacks.onSelectNode(null);
-      }
-    }
-  };
-
-  readonly #onPointerCancel = (event: PointerEvent): void => {
-    if (this.#panSession?.pointerId === event.pointerId) {
-      this.#panSession = null;
-      this.#svg.classList.remove("is-panning");
-    }
-  };
-
-  readonly #onWheel = (event: WheelEvent): void => {
-    event.preventDefault();
-    const rect = this.#svg.getBoundingClientRect();
-    const px = event.clientX - rect.left;
-    const py = event.clientY - rect.top;
-    const delta = clamp(-event.deltaY, -180, 180);
-    const factor = Math.exp(delta * 0.0022);
-    this.#zoomAtPoint(px, py, factor);
+    this.#callbacks.onSelectNode(null);
   };
 
   readonly #onDoubleClick = (event: MouseEvent): void => {
@@ -983,17 +1355,21 @@ export class GraphView {
   };
 
   readonly #onKeyDown = (event: KeyboardEvent): void => {
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
+    const layout = this.#lastLayout;
     const focusedId = this.#findNodeIdFromTarget(event.target);
 
-    if (event.key === "Escape") {
-      event.preventDefault();
-      this.#callbacks.onSelectNode(null);
-      return;
-    }
+    if (!layout || layout.nodes.length === 0) return;
 
-    if (focusedId === null) return;
+    const currentId =
+      focusedId ??
+      this.#lastVm?.selectedNode?.id ??
+      layout.nodes[0]?.node.id ??
+      null;
+    if (currentId === null) return;
 
     if (event.key === "Enter" || event.key === " ") {
+      if (focusedId === null) return;
       event.preventDefault();
       this.#callbacks.onSelectNode(focusedId);
       return;
@@ -1006,65 +1382,30 @@ export class GraphView {
       event.key === "ArrowDown"
     ) {
       event.preventDefault();
-      const next = this.#findDirectionalNeighbor(focusedId, event.key);
-      if (next) {
-        this.#callbacks.onSelectNode(next.node.id);
-        this.#nodeRefs.get(next.node.id)?.group.focus({ preventScroll: true });
-        this.panToNode(next.node.id);
+      if (focusedId === null && this.#lastVm?.selectedNode == null) {
+        this.#callbacks.onSelectNode(currentId);
+        this.#nodeRefs.get(currentId)?.group.focus({ preventScroll: true });
+        this.panToNode(currentId);
+        return;
+      }
+
+      const directionalNodes = layout.nodes.map((n) => ({
+        id: n.node.id,
+        x: n.x,
+        y: n.y,
+        width: n.width,
+        height: n.height,
+      }));
+      const nextId = findNearestDirectionalNode(
+        directionalNodes,
+        currentId,
+        event.key,
+      );
+      if (nextId !== null) {
+        this.#callbacks.onSelectNode(nextId);
+        this.#nodeRefs.get(nextId)?.group.focus({ preventScroll: true });
+        this.panToNode(nextId);
       }
     }
   };
-
-  #findDirectionalNeighbor(
-    currentId: number,
-    direction: "ArrowRight" | "ArrowLeft" | "ArrowUp" | "ArrowDown",
-  ): PositionedNode | null {
-    const layout = this.#lastLayout;
-    if (!layout) return null;
-    const current = layout.nodeById.get(currentId);
-    if (!current) return null;
-
-    let best: PositionedNode | null = null;
-    let bestScore = Number.POSITIVE_INFINITY;
-
-    for (const candidate of layout.nodes) {
-      if (candidate.node.id === currentId) continue;
-
-      const dx = candidate.x - current.x;
-      const dy = candidate.y - current.y;
-
-      let primary = 0;
-      let orthogonal = 0;
-      switch (direction) {
-        case "ArrowRight":
-          if (dx <= 1) continue;
-          primary = dx;
-          orthogonal = Math.abs(dy);
-          break;
-        case "ArrowLeft":
-          if (dx >= -1) continue;
-          primary = -dx;
-          orthogonal = Math.abs(dy);
-          break;
-        case "ArrowDown":
-          if (dy <= 1) continue;
-          primary = dy;
-          orthogonal = Math.abs(dx);
-          break;
-        case "ArrowUp":
-          if (dy >= -1) continue;
-          primary = -dy;
-          orthogonal = Math.abs(dx);
-          break;
-      }
-
-      const score = primary + orthogonal * 2.2;
-      if (score < bestScore) {
-        bestScore = score;
-        best = candidate;
-      }
-    }
-
-    return best;
-  }
 }

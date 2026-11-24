@@ -8,10 +8,13 @@ import type {
 } from "../protocol/types.ts";
 
 export interface InspectorViewCallbacks {
+  readonly transportMode?: "devtools" | "bridge";
   readonly onSelectNode: (nodeId: number) => void;
   readonly onSetStateValue: (nodeId: number, jsonText: string) => void;
   readonly onEvaluateComputed: (nodeId: number) => void;
   readonly onLogNode: (nodeId: number) => void;
+  readonly onFocusSubgraph?: (nodeId: number | null) => void;
+  readonly onOpenSource?: (nodeId: number, site: SourceLocation | null) => void;
 }
 
 interface ActionFeedbackState {
@@ -26,6 +29,7 @@ interface MountedDetailSlots {
   readonly headerSlot: HTMLElement;
   readonly errorSlot: HTMLElement;
   readonly valueSlot: HTMLElement;
+  readonly expressionSlot: HTMLElement;
   readonly editorSlot: HTMLElement;
   readonly feedbackSlot: HTMLElement;
   readonly metricsSlot: HTMLElement;
@@ -104,16 +108,31 @@ export class InspectorView {
 
   showActionResult(
     nodeId: number,
-    kind: "set" | "evaluate" | "log",
+    kind: "set" | "evaluate" | "log" | "focus" | "open-source",
     result: ActionResult,
   ): void {
     if (result.ok) {
-      const okMessage =
-        kind === "set"
-          ? `Updated State #${nodeId}`
-          : kind === "evaluate"
-            ? `Evaluated Computed #${nodeId}`
-            : `Logged #${nodeId} as $signal in Console`;
+      let okMessage: string;
+      switch (kind) {
+        case "set":
+          okMessage = `Updated State #${nodeId}`;
+          break;
+        case "evaluate":
+          okMessage = `Evaluated Computed #${nodeId}`;
+          break;
+        case "log":
+          okMessage = `Logged #${nodeId} as $signal in Console`;
+          break;
+        case "focus":
+          okMessage = `Focused subgraph on #${nodeId}`;
+          break;
+        case "open-source":
+          okMessage =
+            this.#callbacks.transportMode === "bridge"
+              ? "Copied source location to clipboard"
+              : `Opened source for #${nodeId}`;
+          break;
+      }
       this.#feedback = { nodeId, ok: true, message: okMessage };
       if (kind === "set" && this.#mounted && this.#mounted.nodeId === nodeId) {
         this.#mounted.editorDirty = false;
@@ -159,9 +178,10 @@ export class InspectorView {
     const slots = this.#mounted;
     if (!slots) return;
 
-    this.#renderHeader(slots.headerSlot, selected);
+    this.#renderHeader(slots.headerSlot, selected, vm);
     this.#renderError(slots.errorSlot, selected);
     this.#renderValue(slots.valueSlot, selected);
+    this.#renderExpression(slots.expressionSlot, selected);
     this.#syncStateEditor(slots, selected);
     this.#renderFeedbackSlot();
     this.#renderMetrics(slots.metricsSlot, selected, vm.directSourceIds.size);
@@ -231,6 +251,7 @@ export class InspectorView {
     const headerSlot = el("section", "insp-section");
     const errorSlot = el("section", "insp-section");
     const valueSlot = el("section", "insp-section");
+    const expressionSlot = el("section", "insp-section");
     const editorSlot = el("section", "insp-section");
     const feedbackSlot = el("div");
     const metricsSlot = el("section", "insp-section");
@@ -304,6 +325,7 @@ export class InspectorView {
       headerSlot,
       errorSlot,
       valueSlot,
+      expressionSlot,
       editorSlot,
       feedbackSlot,
       metricsSlot,
@@ -318,6 +340,7 @@ export class InspectorView {
       headerSlot,
       errorSlot,
       valueSlot,
+      expressionSlot,
       editorSlot,
       feedbackSlot,
       metricsSlot,
@@ -326,7 +349,11 @@ export class InspectorView {
     );
   }
 
-  #renderHeader(slot: HTMLElement, node: SignalNodeSnapshot): void {
+  #renderHeader(
+    slot: HTMLElement,
+    node: SignalNodeSnapshot,
+    vm: PanelViewModel,
+  ): void {
     const wrap = el("div", "insp-node-header");
 
     const titleRow = el("div", "insp-title-row");
@@ -343,17 +370,6 @@ export class InspectorView {
     nameWrap.appendChild(nameEl);
     nameWrap.appendChild(el("span", "insp-node-id", `#${node.id}`));
     titleRow.appendChild(nameWrap);
-
-    const logBtn = el("button", "tool-btn compact", "Log as $signal");
-    logBtn.type = "button";
-    logBtn.dataset.testid = "log-node-btn";
-    logBtn.title =
-      "Expose this signal instance on globalThis.$signal and log to Console";
-    logBtn.addEventListener("click", () => {
-      this.#callbacks.onLogNode(node.id);
-      this.showActionResult(node.id, "log", { ok: true });
-    });
-    titleRow.appendChild(logBtn);
     wrap.appendChild(titleRow);
 
     const tags = el("div", "meta-tags");
@@ -372,21 +388,90 @@ export class InspectorView {
         el("span", "meta-tag tabular", `seq #${node.lastChangedSeq}`),
       );
     }
+    if (node.internal === true) {
+      tags.appendChild(el("span", "meta-tag is-internal", "internal"));
+    }
+    const ownerLabel = node.ownerLabel?.trim();
+    if (ownerLabel) {
+      const ownerTag = el("span", "meta-tag", ownerLabel);
+      ownerTag.title = `Owner: ${ownerLabel}`;
+      tags.appendChild(ownerTag);
+    }
     wrap.appendChild(tags);
 
     if (node.site) {
-      const callsite = el("div", "callsite-row");
-      const fullSite = formatCallsite(node.site);
-      callsite.title = node.site.fn
-        ? `${node.site.fn} (${fullSite})`
-        : fullSite;
-      if (node.site.fn) {
-        callsite.appendChild(el("span", "callsite-fn", node.site.fn));
+      const site = node.site;
+      const fullSite = formatCallsite(site);
+      const baseTitle = site.fn ? `${site.fn} (${fullSite})` : fullSite;
+      const callsite = this.#callbacks.onOpenSource
+        ? el("button", "callsite-row callsite-btn")
+        : el("div", "callsite-row");
+      if (callsite instanceof HTMLButtonElement) {
+        callsite.type = "button";
+        callsite.dataset.testid = "inspector-site-btn";
+        callsite.title = `Open ${baseTitle} in Sources`;
+        callsite.addEventListener("click", () => {
+          this.#callbacks.onOpenSource?.(node.id, site);
+        });
+      } else {
+        callsite.title = baseTitle;
+      }
+      if (site.fn) {
+        callsite.appendChild(el("span", "callsite-fn", site.fn));
         callsite.appendChild(document.createTextNode(" · "));
       }
       callsite.appendChild(document.createTextNode(fullSite));
       wrap.appendChild(callsite);
     }
+
+    const actions = el("div", "action-group insp-actions");
+
+    const isFocusedRoot = vm.focusedNode?.id === node.id;
+    const focusBtn = el(
+      "button",
+      "tool-btn compact",
+      isFocusedRoot ? "Show full graph" : "Focus subgraph",
+    );
+    focusBtn.type = "button";
+    focusBtn.dataset.testid = "focus-subgraph-btn";
+    focusBtn.setAttribute("aria-pressed", String(isFocusedRoot));
+    focusBtn.title = isFocusedRoot
+      ? "Exit subgraph focus and show full graph"
+      : "Focus graph on this signal's upstream and downstream subgraph";
+    focusBtn.addEventListener("click", () => {
+      this.#callbacks.onFocusSubgraph?.(isFocusedRoot ? null : node.id);
+    });
+    actions.appendChild(focusBtn);
+
+    const openSourceBtn = el("button", "tool-btn compact", "Open Source");
+    openSourceBtn.type = "button";
+    openSourceBtn.dataset.testid = "open-source-btn";
+    if (
+      node.site === null &&
+      (this.#callbacks.transportMode === "bridge" || node.kind === "state")
+    ) {
+      openSourceBtn.disabled = true;
+      openSourceBtn.title = "No source location available";
+    } else {
+      openSourceBtn.title = "Open definition in Sources";
+    }
+    openSourceBtn.addEventListener("click", () => {
+      this.#callbacks.onOpenSource?.(node.id, node.site);
+    });
+    actions.appendChild(openSourceBtn);
+
+    const logBtn = el("button", "tool-btn compact", "Log as $signal");
+    logBtn.type = "button";
+    logBtn.dataset.testid = "log-node-btn";
+    logBtn.title =
+      "Expose this signal instance on globalThis.$signal and log to Console";
+    logBtn.addEventListener("click", () => {
+      this.#callbacks.onLogNode(node.id);
+      this.showActionResult(node.id, "log", { ok: true });
+    });
+    actions.appendChild(logBtn);
+
+    wrap.appendChild(actions);
 
     slot.replaceChildren(wrap);
   }
@@ -499,6 +584,47 @@ export class InspectorView {
       }
       frag.appendChild(details);
     }
+
+    slot.replaceChildren(frag);
+  }
+
+  #renderExpression(slot: HTMLElement, node: SignalNodeSnapshot): void {
+    const sourceText = node.computeSource || node.computeSignature;
+    if (!sourceText) {
+      slot.hidden = true;
+      slot.removeAttribute("data-testid");
+      slot.replaceChildren();
+      return;
+    }
+
+    slot.hidden = false;
+    slot.dataset.testid = "compute-expression-section";
+
+    const frag = document.createDocumentFragment();
+    const head = el("div", "insp-section-head");
+    const titleWrap = el("div", "meta-tags");
+    titleWrap.appendChild(el("h3", "insp-section-title", "Compute Expression"));
+    if (
+      node.computeSignature &&
+      (!node.computeSource ||
+        node.computeSignature.replace(/\s+/g, "") !==
+          node.computeSource.replace(/\s+/g, ""))
+    ) {
+      // Only show signature pill when it differs meaningfully from the source block (not a truncated prefix of source)
+      const collapsedSource = node.computeSource?.replace(/\s+/g, " ").trim();
+      const rawSig = node.computeSignature.replace(/…$/, "");
+      if (!collapsedSource || !collapsedSource.startsWith(rawSig)) {
+        titleWrap.appendChild(el("span", "meta-tag", node.computeSignature));
+      }
+    }
+    head.appendChild(titleWrap);
+    frag.appendChild(head);
+
+    const pre = el("pre", "compute-source-code");
+    const code = el("code");
+    code.textContent = sourceText;
+    pre.appendChild(code);
+    frag.appendChild(pre);
 
     slot.replaceChildren(frag);
   }

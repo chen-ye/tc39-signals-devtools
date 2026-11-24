@@ -39,6 +39,8 @@ export interface SignalNodeSnapshot {
   readonly id: number;
   readonly kind: SignalKind;
   readonly label: string | null;
+  readonly autoLabel?: string | null;
+  readonly ownerLabel?: string | null;
   readonly runtime: string;
   readonly runtimeMode: RuntimeMode;
   readonly site: SourceLocation | null;
@@ -52,6 +54,9 @@ export interface SignalNodeSnapshot {
   readonly lastRunMs: number | null;
   readonly lastChangedSeq: number;
   readonly causes: ReadonlyArray<number>;
+  readonly computeSource?: string | null;
+  readonly computeSignature?: string | null;
+  readonly internal?: boolean;
 }
 
 export interface SignalEdgeSnapshot {
@@ -208,6 +213,7 @@ export interface SignalsDevtoolsHook {
   configure(settings: Partial<HookSettings>): void;
   clearEvents(): void;
   subscribe(listener: () => void): () => void;
+  getTargetFunction?(nodeId: number): ((...args: never[]) => unknown) | null;
 }
 
 export type PanelToPageMessage =

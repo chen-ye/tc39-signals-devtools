@@ -1,10 +1,12 @@
 import {
   DEFAULT_FILTER_STATE,
   derivePanelViewModel,
+  formatNodeDisplayName,
   type EventTypeFilter,
   type KindFilter,
   type LivenessFilter,
   type PanelFilterState,
+  type PanelViewModel,
 } from "./graph-state.ts";
 import { GraphView } from "./graph-view.ts";
 import { InspectorView } from "./inspector-view.ts";
@@ -14,9 +16,26 @@ import {
   normalizeOriginKey,
   type BackgroundToPanelMessage,
   type GraphSnapshot,
+  type SourceLocation,
 } from "../protocol/types.ts";
+import {
+  createPaneLayoutController,
+  getDefaultBottomBounds,
+  getDefaultRightBounds,
+} from "../shared/pane-layout.ts";
+import {
+  clearRuntimeTokens,
+  listExcludedRuntimes,
+  listIncludedRuntimes,
+  matchGlob,
+  parseQuery,
+  rewriteFieldInclusionsToExclusions,
+  setRuntimeExcludedInQuery,
+  setRuntimeOnlyInQuery,
+} from "../shared/query-parser.ts";
+import { registerPanelShortcuts } from "../shared/shortcuts.ts";
+import { createThemeController } from "../shared/theme.ts";
 
-type ThemeMode = "auto" | "light" | "dark";
 type ConnectionStatus = "connecting" | "connected" | "disconnected";
 type DrawerTab = "inspector" | "timeline";
 
@@ -24,6 +43,9 @@ interface PendingAction {
   readonly nodeId: number;
   readonly kind: "set" | "evaluate";
 }
+
+const THEME_STORAGE_KEY = "tc39-signals-theme";
+const PANE_LAYOUT_STORAGE_KEY = "tc39-signals-pane-layout";
 
 function getEl(id: string): HTMLElement {
   const el = document.getElementById(id);
@@ -73,30 +95,38 @@ function isEventTypeFilter(value: string): value is EventTypeFilter {
   );
 }
 
-function isEditableElement(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) return false;
-  if (target.isContentEditable) return true;
-  const tag = target.tagName;
-  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
-}
-
 function initPanel(): void {
   const transport = createPanelTransport();
 
   // DOM references
+  const panelShellEl = getEl("panel-shell");
   const workspaceEl = getEl("workspace");
+  const rightSplitterEl = getEl("splitter-right");
+  const bottomSplitterEl = getEl("splitter-bottom");
   const graphStageEl = getEl("graph-stage");
   const graphMountEl = getEl("graph-mount");
   const emptyStateEl = getEl("empty-state");
   const emptyBridgeStatusEl = getEl("empty-bridge-status");
   const emptySiteToggleBtn = getButton("empty-site-toggle");
   const filterEmptyEl = getEl("filter-empty");
+  const filterEmptyTitleEl = getEl("filter-empty-title");
   const filterEmptySubEl = getEl("filter-empty-sub");
   const resetFiltersBtn = getButton("reset-filters");
 
   const searchInput = getInput("search-input");
+  const searchNavGroup = getEl("search-nav-group");
+  const searchMatchCountEl = getEl("search-match-count");
+  const searchPrevBtn = getButton("search-prev-btn");
+  const searchNextBtn = getButton("search-next-btn");
+  const searchClearBtn = getButton("search-clear-btn");
+  const searchModeBtn = getButton("search-mode-btn");
   const filterErrorsBtn = getButton("filter-errors");
   const filterErrorsCountEl = getEl("filter-errors-count");
+  const toggleInternalBtn = getButton("toggle-internal");
+  const toggleInternalCountEl = getEl("toggle-internal-count");
+  const runtimesDropdownWrapEl = getEl("runtimes-dropdown-wrap");
+  const runtimesFilterBtn = getButton("runtimes-filter-btn");
+  const runtimesPopoverEl = getEl("runtimes-popover");
   const togglePauseBtn = getButton("toggle-pause");
   const togglePauseLabelEl = getEl("toggle-pause-label");
   const toggleStacksBtn = getButton("toggle-stacks");
@@ -117,6 +147,9 @@ function initPanel(): void {
   const filteredPillEl = getEl("filtered-pill");
   const filteredPillTextEl = getEl("filtered-pill-text");
   const filteredResetBtn = getButton("filtered-reset-btn");
+  const focusBreadcrumbEl = getEl("focus-breadcrumb");
+  const focusBreadcrumbLabelEl = getEl("focus-breadcrumb-label");
+  const focusClearBtn = getButton("focus-clear-btn");
 
   const modeBadgeEl = getEl("mode-badge");
   const siteToggleBtn = getButton("site-toggle");
@@ -166,34 +199,31 @@ function initPanel(): void {
   let siteToggleEnabled = false;
   let siteToggleDirty = false;
   let activeTab: DrawerTab = "inspector";
-  let timelineCollapsed = false;
   let requestCounter = 0;
   let rafId: number | null = null;
   let lastRenderAt = 0;
+  let activeMatchIndex = -1;
+  let activeSearchMatchId: number | null = null;
+  let lastVm: PanelViewModel | null = null;
 
   const pendingActions = new Map<string, PendingAction>();
   const startupTimers: Array<ReturnType<typeof setTimeout>> = [];
 
   // Theme setup (respects Chrome DevTools theme when available, otherwise auto system scheme)
-  let themeMode: ThemeMode = "auto";
-
-  const applyTheme = (mode: ThemeMode): void => {
-    themeMode = mode;
-    if (mode === "auto") {
-      const dtTheme = transport.getDevToolsTheme();
-      if (dtTheme) {
-        document.documentElement.dataset.theme = dtTheme;
-      } else {
-        document.documentElement.removeAttribute("data-theme");
-      }
-      toggleThemeLabelEl.textContent = "Auto";
-    } else {
-      document.documentElement.dataset.theme = mode;
-      toggleThemeLabelEl.textContent = mode === "dark" ? "Dark" : "Light";
-    }
-    toggleThemeBtn.title = `Panel theme: ${toggleThemeLabelEl.textContent} (click to switch)`;
-  };
-  applyTheme(themeMode);
+  const themeController = createThemeController({
+    storageKey: THEME_STORAGE_KEY,
+    getDevToolsTheme: () => transport.getDevToolsTheme(),
+    onChange: (preference) => {
+      const label =
+        preference === "auto"
+          ? "Auto"
+          : preference === "dark"
+            ? "Dark"
+            : "Light";
+      toggleThemeLabelEl.textContent = label;
+      toggleThemeBtn.title = `Panel theme: ${label} (click to switch)`;
+    },
+  });
 
   if (transport.mode === "bridge") {
     modeBadgeEl.hidden = false;
@@ -213,8 +243,22 @@ function initPanel(): void {
     inspectorBodyEl,
     inspectorSubtitleEl,
     {
+      transportMode: transport.mode,
       onSelectNode(nodeId) {
         selectNode(nodeId, true);
+      },
+      onFocusSubgraph(nodeId) {
+        filterState = { ...filterState, focusSubgraphNodeId: nodeId };
+        if (nodeId !== null) {
+          selectedNodeId = nodeId;
+        }
+        renderNow();
+        graphView.fitToViewport();
+      },
+      onOpenSource(nodeId: number, site: SourceLocation | null) {
+        void transport.openSource(nodeId, site).then((result) => {
+          inspectorView.showActionResult(nodeId, "open-source", result);
+        });
       },
       onSetStateValue(nodeId, jsonText) {
         const requestId = `req-${++requestCounter}`;
@@ -254,6 +298,30 @@ function initPanel(): void {
       },
     },
   );
+
+  const syncBottomCollapsedUi = (collapsed: boolean): void => {
+    workspaceEl.dataset.timelineCollapsed = String(collapsed);
+    timelineCollapseBtn.setAttribute("aria-expanded", String(!collapsed));
+  };
+
+  const paneLayout = createPaneLayoutController({
+    rootEl: panelShellEl,
+    workspaceEl,
+    rightSplitterEl,
+    bottomSplitterEl,
+    getRightBounds: (w) => getDefaultRightBounds(Math.max(0, w - 6)),
+    getBottomBounds: (h) => getDefaultBottomBounds(Math.max(0, h - 6)),
+    storageKey: PANE_LAYOUT_STORAGE_KEY,
+    defaultState: {
+      rightWidthPx: 340,
+      bottomHeightPx: 220,
+      bottomCollapsed: false,
+    },
+    onChange: (state) => {
+      syncBottomCollapsedUi(state.bottomCollapsed);
+    },
+  });
+  syncBottomCollapsedUi(paneLayout.getState().bottomCollapsed);
 
   function selectNode(nodeId: number | null, panIntoView: boolean): void {
     selectedNodeId = nodeId;
@@ -360,6 +428,269 @@ function initPanel(): void {
     });
   }
 
+  function reconcileActiveMatch(vm: PanelViewModel): number | null {
+    const matches = vm.orderedMatchIds;
+    if (matches.length === 0) {
+      activeMatchIndex = -1;
+      activeSearchMatchId = null;
+      return null;
+    }
+    if (activeSearchMatchId !== null) {
+      const existingIdx = matches.indexOf(activeSearchMatchId);
+      if (existingIdx !== -1) {
+        activeMatchIndex = existingIdx;
+        return activeSearchMatchId;
+      }
+    }
+    const clampedIdx =
+      activeMatchIndex >= 0 && activeMatchIndex < matches.length
+        ? activeMatchIndex
+        : 0;
+    activeMatchIndex = clampedIdx;
+    activeSearchMatchId = matches[clampedIdx] ?? null;
+    return activeSearchMatchId;
+  }
+
+  function updateSearchControls(vm: PanelViewModel): void {
+    const isFilterMode = filterState.queryMode === "filter";
+    searchModeBtn.textContent = isFilterMode ? "Filter" : "Highlight";
+    searchModeBtn.setAttribute("aria-pressed", String(isFilterMode));
+    searchModeBtn.title = isFilterMode
+      ? "Search mode: Filter graph to matches only (click to switch to Highlight)"
+      : "Search mode: Highlight matches in graph (click to switch to Filter)";
+
+    const parsed = parseQuery(filterState.query);
+    const hasPositiveInclusions = parsed.inclusions.length > 0;
+    const totalMatches = vm.orderedMatchIds.length;
+
+    if (!hasPositiveInclusions) {
+      searchNavGroup.hidden = true;
+      searchMatchCountEl.textContent = "0/0";
+      searchMatchCountEl.classList.remove("is-no-match");
+      return;
+    }
+
+    searchNavGroup.hidden = false;
+    if (totalMatches > 0) {
+      const displayIdx = activeMatchIndex >= 0 ? activeMatchIndex + 1 : 1;
+      searchMatchCountEl.textContent = `${displayIdx}/${totalMatches}`;
+      searchMatchCountEl.classList.remove("is-no-match");
+      searchPrevBtn.disabled = false;
+      searchNextBtn.disabled = false;
+    } else {
+      searchMatchCountEl.textContent = "0/0";
+      searchMatchCountEl.classList.add("is-no-match");
+      searchPrevBtn.disabled = true;
+      searchNextBtn.disabled = true;
+    }
+  }
+
+  function applyQueryUpdate(
+    nextQuery: string,
+    options: { readonly resetMatch: boolean; readonly fit: boolean },
+  ): void {
+    if (searchInput.value !== nextQuery) {
+      searchInput.value = nextQuery;
+    }
+    if (options.resetMatch) {
+      activeMatchIndex = 0;
+      activeSearchMatchId = null;
+    }
+    filterState = { ...filterState, query: nextQuery };
+    renderNow();
+    if (options.fit) {
+      graphView.fitToViewport();
+    }
+  }
+
+  function stepSearchMatch(delta: 1 | -1): void {
+    const matches = lastVm?.orderedMatchIds ?? [];
+    if (matches.length === 0) return;
+    const baseIndex = activeMatchIndex < 0 ? 0 : activeMatchIndex;
+    const nextIndex = (baseIndex + delta + matches.length) % matches.length;
+    activeMatchIndex = nextIndex;
+    activeSearchMatchId = matches[nextIndex] ?? null;
+    renderNow();
+    if (activeSearchMatchId !== null) {
+      graphView.panToNode(activeSearchMatchId);
+    }
+  }
+
+  function clearSearch(): void {
+    applyQueryUpdate("", {
+      resetMatch: true,
+      fit: filterState.queryMode === "filter",
+    });
+  }
+
+  function updateRuntimesButton(vm: PanelViewModel): void {
+    const total = vm.runtimeInventory.length;
+    const excludedCount = vm.runtimeInventory.filter((r) => r.excluded).length;
+    const includedCount = vm.runtimeInventory.filter((r) => r.included).length;
+    const hasRuntimeQuery =
+      listExcludedRuntimes(filterState.query).length > 0 ||
+      listIncludedRuntimes(filterState.query).length > 0;
+
+    if (hasRuntimeQuery || excludedCount > 0 || includedCount > 0) {
+      runtimesFilterBtn.dataset.active = "true";
+    } else {
+      delete runtimesFilterBtn.dataset.active;
+    }
+
+    if (excludedCount > 0 && total > 0) {
+      runtimesFilterBtn.textContent = `Runtimes (${total - excludedCount}/${total}) ▾`;
+    } else if (includedCount > 0) {
+      runtimesFilterBtn.textContent = `Runtimes (${includedCount}) ▾`;
+    } else if (total > 0) {
+      runtimesFilterBtn.textContent = `Runtimes (${total}) ▾`;
+    } else {
+      runtimesFilterBtn.textContent = "Runtimes ▾";
+    }
+  }
+
+  function renderRuntimesPopover(vm: PanelViewModel): void {
+    const header = document.createElement("div");
+    header.className = "runtimes-popover-header";
+
+    const title = document.createElement("span");
+    title.className = "runtimes-popover-title";
+    title.textContent = "Signal Runtimes";
+
+    const resetBtn = document.createElement("button");
+    resetBtn.type = "button";
+    resetBtn.className = "runtimes-popover-reset";
+    resetBtn.textContent = "Show all";
+    const hasRuntimeTokens =
+      listExcludedRuntimes(filterState.query).length > 0 ||
+      listIncludedRuntimes(filterState.query).length > 0;
+    resetBtn.disabled = !hasRuntimeTokens;
+    resetBtn.addEventListener("click", () => {
+      const nextQuery = clearRuntimeTokens(filterState.query);
+      applyQueryUpdate(nextQuery, { resetMatch: false, fit: true });
+    });
+
+    header.append(title, resetBtn);
+
+    const body = document.createElement("div");
+    body.className = "runtimes-popover-body";
+
+    if (vm.runtimeInventory.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "runtimes-empty";
+      empty.textContent = "No signal runtimes tracked yet.";
+      body.append(empty);
+      runtimesPopoverEl.replaceChildren(header, body);
+      return;
+    }
+
+    const includedRuntimes = listIncludedRuntimes(filterState.query);
+    const allRuntimeNames = vm.runtimeInventory.map((entry) => entry.name);
+    const filterByInclusions =
+      filterState.queryMode === "filter" && includedRuntimes.length > 0;
+    const isRuntimeChecked = (
+      entry: (typeof vm.runtimeInventory)[number],
+    ): boolean =>
+      !entry.excluded &&
+      (!filterByInclusions ||
+        includedRuntimes.every((inc) => matchGlob(inc, entry.name)));
+
+    for (const entry of vm.runtimeInventory) {
+      const row = document.createElement("div");
+      row.className = "runtimes-row";
+
+      const label = document.createElement("label");
+      label.className = "runtimes-toggle-label";
+
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.className = "runtimes-checkbox";
+      checkbox.checked = isRuntimeChecked(entry);
+      checkbox.addEventListener("change", () => {
+        if (filterByInclusions) {
+          const nextIncluded = vm.runtimeInventory
+            .filter((r) =>
+              r.name.toLowerCase() === entry.name.toLowerCase()
+                ? checkbox.checked
+                : isRuntimeChecked(r),
+            )
+            .map((r) => r.name);
+          const nextQuery = rewriteFieldInclusionsToExclusions(
+            filterState.query,
+            "runtime",
+            nextIncluded,
+            allRuntimeNames,
+          );
+          applyQueryUpdate(nextQuery, { resetMatch: false, fit: true });
+          return;
+        }
+        const nextQuery = setRuntimeExcludedInQuery(
+          filterState.query,
+          entry.name,
+          !checkbox.checked,
+          allRuntimeNames,
+        );
+        applyQueryUpdate(nextQuery, { resetMatch: false, fit: true });
+      });
+
+      const nameSpan = document.createElement("span");
+      nameSpan.className = "runtimes-name";
+      nameSpan.textContent = entry.name;
+      nameSpan.title = `${entry.name} (${entry.mode})`;
+
+      const modeSpan = document.createElement("span");
+      modeSpan.className = "runtimes-mode";
+      modeSpan.textContent = entry.mode;
+
+      const countSpan = document.createElement("span");
+      countSpan.className = "runtimes-count";
+      countSpan.textContent = String(entry.count);
+
+      label.append(checkbox, nameSpan, modeSpan, countSpan);
+
+      const onlyBtn = document.createElement("button");
+      onlyBtn.type = "button";
+      onlyBtn.className = "runtimes-only-btn";
+      onlyBtn.textContent = "Only";
+      const isOnly =
+        includedRuntimes.length === 1 &&
+        includedRuntimes[0]?.toLowerCase() === entry.name.toLowerCase();
+      onlyBtn.setAttribute("aria-pressed", String(isOnly));
+      onlyBtn.addEventListener("click", () => {
+        const nextQuery = isOnly
+          ? clearRuntimeTokens(filterState.query)
+          : setRuntimeOnlyInQuery(filterState.query, entry.name);
+        applyQueryUpdate(nextQuery, {
+          resetMatch: true,
+          fit: filterState.queryMode === "filter",
+        });
+      });
+
+      row.append(label, onlyBtn);
+      body.append(row);
+    }
+
+    runtimesPopoverEl.replaceChildren(header, body);
+  }
+
+  function closeRuntimesPopover(): void {
+    if (runtimesPopoverEl.hidden) return;
+    runtimesPopoverEl.hidden = true;
+    runtimesFilterBtn.setAttribute("aria-expanded", "false");
+  }
+
+  function openRuntimesPopover(): void {
+    const btnRect = runtimesFilterBtn.getBoundingClientRect();
+    runtimesPopoverEl.classList.toggle(
+      "is-align-end",
+      btnRect.left + 260 > window.innerWidth,
+    );
+    runtimesPopoverEl.hidden = false;
+    runtimesFilterBtn.setAttribute("aria-expanded", "true");
+    if (lastVm) {
+      renderRuntimesPopover(lastVm);
+    }
+  }
+
   function resetGraphFilters(): void {
     filterState = {
       ...filterState,
@@ -367,10 +698,16 @@ function initPanel(): void {
       kindFilter: "all",
       livenessFilter: "all",
       onlyErrored: false,
+      showInternal: false,
+      focusSubgraphNodeId: null,
     };
     searchInput.value = "";
+    activeMatchIndex = -1;
+    activeSearchMatchId = null;
+    closeRuntimesPopover();
     syncFilterControls();
     renderNow();
+    graphView.fitToViewport();
   }
 
   function renderNow(): void {
@@ -385,6 +722,8 @@ function initPanel(): void {
       filterState,
       selectedNodeId,
     );
+    lastVm = vm;
+    const activeMatchId = reconcileActiveMatch(vm);
 
     // If previously selected node was GC'd, clear selection cleanly
     if (selectedNodeId !== null && vm.selectedNode === null) {
@@ -403,11 +742,30 @@ function initPanel(): void {
     statErrorsWrapEl.classList.toggle("has-errors", hasErrors);
     filterErrorsBtn.classList.toggle("has-errors", hasErrors);
 
+    const internalCount = vm.stats.internalCount;
+    toggleInternalCountEl.textContent = String(internalCount);
+    toggleInternalBtn.hidden = internalCount === 0;
+    toggleInternalBtn.setAttribute(
+      "aria-pressed",
+      String(filterState.showInternal),
+    );
+
+    const baselineTotal = filterState.showInternal
+      ? vm.stats.totalNodes
+      : vm.stats.totalNodes - internalCount;
     const isFiltered =
-      vm.stats.totalNodes > 0 && vm.visibleNodes.length < vm.stats.totalNodes;
+      baselineTotal > 0 && vm.visibleNodes.length < baselineTotal;
     filteredPillEl.hidden = !isFiltered;
     if (isFiltered) {
-      filteredPillTextEl.textContent = `Showing ${vm.visibleNodes.length} / ${vm.stats.totalNodes}`;
+      filteredPillTextEl.textContent = `Showing ${vm.visibleNodes.length} / ${baselineTotal}`;
+    }
+
+    if (vm.focusedNode) {
+      focusBreadcrumbEl.hidden = false;
+      focusBreadcrumbLabelEl.textContent = `Focused: ${formatNodeDisplayName(vm.focusedNode)} #${vm.focusedNode.id}`;
+    } else {
+      focusBreadcrumbEl.hidden = true;
+      focusBreadcrumbLabelEl.textContent = "";
     }
 
     const paused = vm.snapshot?.settings.paused ?? false;
@@ -430,6 +788,7 @@ function initPanel(): void {
 
     // Empty state overlays & workspace empty layout
     const hasAnySignals = vm.stats.totalNodes > 0;
+    panelShellEl.dataset.empty = String(!hasAnySignals);
     workspaceEl.dataset.empty = String(!hasAnySignals);
     emptyStateEl.hidden = hasAnySignals;
     if (graphLegendEl) graphLegendEl.hidden = !hasAnySignals;
@@ -438,13 +797,33 @@ function initPanel(): void {
     const showFilterEmpty = hasAnySignals && vm.visibleNodes.length === 0;
     filterEmptyEl.hidden = !showFilterEmpty;
     if (showFilterEmpty) {
-      filterEmptySubEl.textContent = `${vm.stats.totalNodes} signal${vm.stats.totalNodes === 1 ? "" : "s"} hidden by current search or filter pills.`;
+      if (
+        baselineTotal === 0 &&
+        internalCount > 0 &&
+        !filterState.showInternal
+      ) {
+        filterEmptyTitleEl.textContent = "Only internal signals detected";
+        filterEmptySubEl.textContent = `${internalCount} internal signal${internalCount === 1 ? "" : "s"} hidden by default.`;
+        resetFiltersBtn.textContent = "Show internal signals";
+      } else {
+        const hiddenCount = filterState.showInternal
+          ? vm.stats.totalNodes
+          : baselineTotal;
+        filterEmptyTitleEl.textContent = "No signals match the active filters";
+        filterEmptySubEl.textContent = `${hiddenCount} signal${hiddenCount === 1 ? "" : "s"} hidden by current search or filter pills.`;
+        resetFiltersBtn.textContent = "Reset filters";
+      }
     }
 
     syncConnectionAndSiteUI();
     syncFilterControls();
+    updateSearchControls(vm);
+    updateRuntimesButton(vm);
+    if (!runtimesPopoverEl.hidden) {
+      renderRuntimesPopover(vm);
+    }
 
-    graphView.render(vm);
+    graphView.render(vm, activeMatchId);
     inspectorView.render(vm);
     timelineView.render(vm);
   }
@@ -470,6 +849,14 @@ function initPanel(): void {
       switch (msg.type) {
         case "SNAPSHOT":
           latestSnapshot = msg.snapshot;
+          if (
+            filterState.focusSubgraphNodeId !== null &&
+            !msg.snapshot.nodes.some(
+              (n) => n.id === filterState.focusSubgraphNodeId,
+            )
+          ) {
+            filterState = { ...filterState, focusSubgraphNodeId: null };
+          }
           if (connectionStatus !== "connected") {
             connectionStatus = "connected";
           }
@@ -490,6 +877,7 @@ function initPanel(): void {
         case "PAGE_NAVIGATING": {
           latestSnapshot = null;
           selectedNodeId = null;
+          filterState = { ...filterState, focusSubgraphNodeId: null };
           connectionStatus = "connecting";
           connectedUrl = msg.url;
           const nextOrigin = normalizeOriginKey(msg.url);
@@ -535,10 +923,45 @@ function initPanel(): void {
     },
   );
 
-  // Wire toolbar & controls
+  // Wire search & filter controls
   searchInput.addEventListener("input", () => {
-    filterState = { ...filterState, query: searchInput.value };
+    applyQueryUpdate(searchInput.value, {
+      resetMatch: true,
+      fit: filterState.queryMode === "filter",
+    });
+  });
+
+  searchInput.addEventListener("keydown", (event) => {
+    if (event.ctrlKey || event.metaKey || event.altKey) return;
+    if (event.key === "Enter") {
+      event.preventDefault();
+      stepSearchMatch(event.shiftKey ? -1 : 1);
+    } else if (event.key === "Escape") {
+      if (searchInput.value.length > 0) {
+        event.preventDefault();
+        clearSearch();
+      } else {
+        searchInput.blur();
+      }
+    }
+  });
+
+  searchModeBtn.addEventListener("click", () => {
+    filterState = {
+      ...filterState,
+      queryMode: filterState.queryMode === "highlight" ? "filter" : "highlight",
+    };
     renderNow();
+    if (parseQuery(filterState.query).inclusions.length > 0) {
+      graphView.fitToViewport();
+    }
+  });
+
+  searchPrevBtn.addEventListener("click", () => stepSearchMatch(-1));
+  searchNextBtn.addEventListener("click", () => stepSearchMatch(1));
+  searchClearBtn.addEventListener("click", () => {
+    clearSearch();
+    searchInput.focus();
   });
 
   for (const btn of kindButtons) {
@@ -547,6 +970,7 @@ function initPanel(): void {
       if (!isKindFilter(value)) return;
       filterState = { ...filterState, kindFilter: value };
       renderNow();
+      graphView.fitToViewport();
     });
   }
 
@@ -556,12 +980,52 @@ function initPanel(): void {
       if (!isLivenessFilter(value)) return;
       filterState = { ...filterState, livenessFilter: value };
       renderNow();
+      graphView.fitToViewport();
     });
   }
 
   filterErrorsBtn.addEventListener("click", () => {
     filterState = { ...filterState, onlyErrored: !filterState.onlyErrored };
     renderNow();
+    graphView.fitToViewport();
+  });
+
+  toggleInternalBtn.addEventListener("click", () => {
+    filterState = { ...filterState, showInternal: !filterState.showInternal };
+    renderNow();
+    graphView.fitToViewport();
+  });
+
+  runtimesFilterBtn.addEventListener("click", () => {
+    if (runtimesPopoverEl.hidden) {
+      openRuntimesPopover();
+    } else {
+      closeRuntimesPopover();
+    }
+  });
+
+  runtimesPopoverEl.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      closeRuntimesPopover();
+      runtimesFilterBtn.focus();
+    }
+  });
+
+  const onDocumentPointerDown = (event: PointerEvent): void => {
+    if (runtimesPopoverEl.hidden) return;
+    const target = event.target;
+    if (target instanceof Node && !runtimesDropdownWrapEl.contains(target)) {
+      closeRuntimesPopover();
+    }
+  };
+  document.addEventListener("pointerdown", onDocumentPointerDown);
+
+  focusClearBtn.addEventListener("click", () => {
+    filterState = { ...filterState, focusSubgraphNodeId: null };
+    renderNow();
+    graphView.fitToViewport();
   });
 
   togglePauseBtn.addEventListener("click", () => {
@@ -593,12 +1057,36 @@ function initPanel(): void {
   zoomLevelBtn.addEventListener("click", () => graphView.resetZoom());
 
   toggleThemeBtn.addEventListener("click", () => {
-    const next: ThemeMode =
-      themeMode === "auto" ? "dark" : themeMode === "dark" ? "light" : "auto";
-    applyTheme(next);
+    themeController.cycle();
   });
 
-  resetFiltersBtn.addEventListener("click", resetGraphFilters);
+  resetFiltersBtn.addEventListener("click", () => {
+    const onlyInternalHidden =
+      lastVm !== null &&
+      lastVm.stats.totalNodes > 0 &&
+      lastVm.stats.internalCount === lastVm.stats.totalNodes &&
+      !filterState.showInternal;
+    if (onlyInternalHidden) {
+      filterState = {
+        ...filterState,
+        query: "",
+        kindFilter: "all",
+        livenessFilter: "all",
+        onlyErrored: false,
+        showInternal: true,
+        focusSubgraphNodeId: null,
+      };
+      searchInput.value = "";
+      activeMatchIndex = -1;
+      activeSearchMatchId = null;
+      closeRuntimesPopover();
+      syncFilterControls();
+      renderNow();
+      graphView.fitToViewport();
+      return;
+    }
+    resetGraphFilters();
+  });
   filteredResetBtn.addEventListener("click", resetGraphFilters);
 
   siteToggleBtn.addEventListener("click", toggleSiteInjection);
@@ -630,35 +1118,82 @@ function initPanel(): void {
   });
 
   timelineCollapseBtn.addEventListener("click", () => {
-    timelineCollapsed = !timelineCollapsed;
-    workspaceEl.dataset.timelineCollapsed = String(timelineCollapsed);
-    timelineCollapseBtn.setAttribute(
-      "aria-expanded",
-      String(!timelineCollapsed),
-    );
+    paneLayout.toggleBottomCollapsed();
   });
 
   // Panel-level keyboard shortcuts
-  const onDocumentKeyDown = (event: KeyboardEvent): void => {
-    if (isEditableElement(event.target)) return;
-    if (event.metaKey || event.ctrlKey || event.altKey) return;
-
-    if (event.key === "/") {
-      event.preventDefault();
+  const disposeShortcuts = registerPanelShortcuts(window, {
+    onSearch: () => {
       searchInput.focus();
       searchInput.select();
-    } else if (event.key === "0") {
-      event.preventDefault();
-      graphView.fitToViewport();
-    } else if (event.key === "+" || event.key === "=") {
-      event.preventDefault();
-      graphView.zoomBy(1.2);
-    } else if (event.key === "-") {
-      event.preventDefault();
-      graphView.zoomBy(1 / 1.2);
+    },
+    onEscape: () => {
+      if (!runtimesPopoverEl.hidden) {
+        closeRuntimesPopover();
+        return true;
+      }
+      if (filterState.focusSubgraphNodeId !== null) {
+        filterState = { ...filterState, focusSubgraphNodeId: null };
+        renderNow();
+        return true;
+      }
+      if (selectedNodeId !== null) {
+        selectedNodeId = null;
+        renderNow();
+        return true;
+      }
+      return false;
+    },
+    onFit: () => graphView.fitToViewport(),
+    onZoomIn: () => graphView.zoomBy(1.2),
+    onZoomOut: () => graphView.zoomBy(1 / 1.2),
+  });
+
+  // DevTools Ctrl+F / Cmd+F integration
+  const handleDevtoolsSearch = (action: string, query?: string): void => {
+    switch (action) {
+      case "performSearch": {
+        applyQueryUpdate(query ?? "", {
+          resetMatch: true,
+          fit: filterState.queryMode === "filter",
+        });
+        if (
+          filterState.queryMode === "highlight" &&
+          activeSearchMatchId !== null
+        ) {
+          graphView.panToNode(activeSearchMatchId);
+        }
+        break;
+      }
+      case "nextSearchResult":
+        stepSearchMatch(1);
+        break;
+      case "previousSearchResult":
+        stepSearchMatch(-1);
+        break;
+      case "cancelSearch":
+        clearSearch();
+        break;
     }
   };
-  document.addEventListener("keydown", onDocumentKeyDown);
+
+  Reflect.set(window, "__SIGNALS_DEVTOOLS_ON_SEARCH__", handleDevtoolsSearch);
+
+  const pendingSearchRaw: unknown = Reflect.get(
+    window,
+    "__SIGNALS_DEVTOOLS_PENDING_SEARCH__",
+  );
+  if (pendingSearchRaw !== null && typeof pendingSearchRaw === "object") {
+    const action: unknown = Reflect.get(pendingSearchRaw, "action");
+    const queryString: unknown = Reflect.get(pendingSearchRaw, "queryString");
+    Reflect.deleteProperty(window, "__SIGNALS_DEVTOOLS_PENDING_SEARCH__");
+    if (typeof action === "string") {
+      handleDevtoolsSearch(
+        action,
+        typeof queryString === "string" ? queryString : undefined,
+      );
+    }
+  }
 
   // Initial render & inspection handshake (with gentle startup retry for iframe load race)
   setActiveTab(activeTab);
@@ -678,7 +1213,11 @@ function initPanel(): void {
   window.addEventListener("beforeunload", () => {
     clearStartupTimers();
     if (rafId !== null) cancelAnimationFrame(rafId);
-    document.removeEventListener("keydown", onDocumentKeyDown);
+    disposeShortcuts();
+    document.removeEventListener("pointerdown", onDocumentPointerDown);
+    Reflect.deleteProperty(window, "__SIGNALS_DEVTOOLS_ON_SEARCH__");
+    themeController.dispose();
+    paneLayout.dispose();
     unsubscribeTransport();
     graphView.dispose();
     timelineView.dispose();
